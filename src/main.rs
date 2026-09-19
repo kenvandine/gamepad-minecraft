@@ -381,8 +381,12 @@ fn refresh_instance_grid(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
 
     let instances = state.lock().unwrap().instances.instances.clone();
     for meta in instances {
+        let loader_tag = match meta.loader {
+            instance::Loader::Fabric => "Fabric",
+            instance::Loader::Vanilla => "Vanilla",
+        };
         let label = match meta.state {
-            InstallState::Installed => format!("Play {} (Fabric)", meta.mc_version),
+            InstallState::Installed => format!("Play {} ({loader_tag})", meta.mc_version),
             InstallState::Downloading => format!("{} — installing...", meta.mc_version),
             InstallState::Failed => format!("{} — install failed, select to retry", meta.mc_version),
             InstallState::NotInstalled => format!("{} — not installed", meta.mc_version),
@@ -538,14 +542,31 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
     let widgets2 = widgets.clone();
     let meta2 = meta.clone();
     net::spawn_blocking_with_progress(
-        move |report| -> Result<(), HttpError> {
+        // `Ok(Some(warning))` means the vanilla install succeeded but
+        // Fabric/Controlify couldn't be layered on - most commonly
+        // because mod authors haven't published a build for a
+        // brand-new Minecraft release yet (this lags by days/weeks
+        // after every release, completely normal). Falling back to a
+        // working vanilla instance beats losing the whole install over
+        // it; `Err` is reserved for the vanilla install itself failing.
+        move |report| -> Result<Option<String>, HttpError> {
             instance::install_instance(&meta2, |done, total| report(done, total))?;
-            fabric::install_fabric_loader(&meta2)?;
-            fabric::inject_controlify_mod(&meta2)?;
-            Ok(())
+            if meta2.loader == instance::Loader::Fabric {
+                let fabric_result = fabric::install_fabric_loader(&meta2)
+                    .and_then(|_| fabric::inject_controlify_mod(&meta2));
+                if let Err(e) = fabric_result {
+                    return Ok(Some(format!(
+                        "Fabric/Controlify aren't available yet for Minecraft {} ({e}). \
+                         Installed without them - try an older version for full controller support.",
+                        meta2.mc_version
+                    )));
+                }
+            }
+            Ok(None)
         },
         on_progress,
         move |result| {
+            let fell_back_to_vanilla = matches!(result, Ok(Some(_)));
             {
                 let mut data = state2.lock().unwrap();
                 if let Some(entry) = data.instances.instances.iter_mut().find(|i| i.id == meta.id) {
@@ -554,19 +575,18 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
                     } else {
                         InstallState::Failed
                     };
+                    if fell_back_to_vanilla {
+                        entry.loader = instance::Loader::Vanilla;
+                    }
                 }
                 let _ = data.instances.save();
             }
             widgets2.install_progress.set_visible(false);
-            widgets2.home_status_label.set_label(match &result {
-                Ok(()) => "Install complete.",
-                Err(_) => "Install failed - select the instance to retry.",
+            widgets2.home_status_label.set_label(&match result {
+                Ok(None) => "Install complete.".to_string(),
+                Ok(Some(warning)) => warning,
+                Err(e) => format!("Install failed: {e}"),
             });
-            if let Err(e) = result {
-                widgets2
-                    .home_status_label
-                    .set_label(&format!("Install failed: {e}"));
-            }
             refresh_instance_grid(&state2, &widgets2);
         },
     );
@@ -737,7 +757,11 @@ fn refresh_settings_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
 
     let instances = state.lock().unwrap().instances.instances.clone();
     for meta in instances {
-        let btn = gtk::Button::with_label(&format!("Delete {} (Fabric)", meta.mc_version));
+        let loader_tag = match meta.loader {
+            instance::Loader::Fabric => "Fabric",
+            instance::Loader::Vanilla => "Vanilla",
+        };
+        let btn = gtk::Button::with_label(&format!("Delete {} ({loader_tag})", meta.mc_version));
         btn.set_css_classes(&["action-button"]);
 
         let state_for_btn = state.clone();
