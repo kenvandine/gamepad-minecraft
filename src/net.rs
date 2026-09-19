@@ -77,6 +77,45 @@ where
     });
 }
 
+/// Like `spawn_blocking`, but `job` also receives a `report(done, total)`
+/// callback it can call as it goes (e.g. `instance::install_instance`'s
+/// own `on_progress` parameter) - each call crosses to the GTK main loop
+/// on its own channel and drives `on_progress`, independently of the
+/// final `on_done` result. A progress bar doesn't need every single
+/// update, so a bounded channel with `send_blocking` is fine: it applies
+/// gentle backpressure on a slow consumer rather than dropping updates
+/// or blocking the GTK main loop (the worker thread blocks briefly, not
+/// the UI thread).
+pub fn spawn_blocking_with_progress<T, F, G, U>(job: F, on_progress: G, on_done: U)
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn Fn(u64, u64)) -> Result<T, HttpError> + Send + 'static,
+    G: Fn(u64, u64) + 'static,
+    U: FnOnce(Result<T, HttpError>) + 'static,
+{
+    let (progress_tx, progress_rx) = async_channel::bounded::<(u64, u64)>(8);
+    let (done_tx, done_rx) = async_channel::bounded(1);
+
+    std::thread::spawn(move || {
+        let report = |done: u64, total: u64| {
+            let _ = progress_tx.send_blocking((done, total));
+        };
+        let result = job(&report);
+        let _ = done_tx.send_blocking(result);
+    });
+
+    glib::spawn_future_local(async move {
+        while let Ok((done, total)) = progress_rx.recv().await {
+            on_progress(done, total);
+        }
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(result) = done_rx.recv().await {
+            on_done(result);
+        }
+    });
+}
+
 /// GET `url` and deserialize the JSON response as `T`.
 pub fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, HttpError> {
     client()

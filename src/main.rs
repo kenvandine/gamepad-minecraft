@@ -25,6 +25,7 @@ use net::HttpError;
 enum View {
     Login,
     Home,
+    VersionPicker,
     InstanceDetail,
     Accounts,
     Settings,
@@ -59,6 +60,10 @@ struct Widgets {
     home_status_label: gtk::Label,
     instance_list: gtk::Box,
     add_instance_btn: gtk::Button,
+    install_progress: gtk::ProgressBar,
+    // Version picker page
+    version_status_label: gtk::Label,
+    version_list: gtk::Box,
     sound: audio::Player,
     haptics: Option<haptics::Haptics>,
 }
@@ -84,6 +89,11 @@ impl Widgets {
                     self.add_instance_btn.grab_focus();
                 }
             }
+            View::VersionPicker => {
+                if let Some(first) = self.version_list.first_child() {
+                    first.grab_focus();
+                }
+            }
             _ => {}
         }
     }
@@ -93,6 +103,7 @@ fn view_name(view: View) -> &'static str {
     match view {
         View::Login => "login",
         View::Home => "home",
+        View::VersionPicker => "version-picker",
         View::InstanceDetail => "instance-detail",
         View::Accounts => "accounts",
         View::Settings => "settings",
@@ -369,14 +380,26 @@ fn refresh_instance_grid(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     }
 }
 
-/// Downloads Mojang's version manifest and starts installing an
-/// instance for the latest release with Fabric + Controlify, the same
-/// way `start_install` retries a failed/not-yet-installed one. A full
-/// version-picker screen (any version, not just latest release) is a
-/// follow-up UI piece, not a blocker for the install/launch pipeline
-/// itself working end-to-end.
-fn start_add_instance(state: Arc<Mutex<AppData>>, widgets: Widgets) {
-    widgets.home_status_label.set_label("Fetching version list...");
+/// How many recent release versions the picker offers. Mojang's
+/// manifest lists 900+ versions total (every release and snapshot ever
+/// shipped) - scrolling a gamepad-navigable list through all of them
+/// would be miserable, and nobody picking a version for a fresh install
+/// wants anything but a recent one anyway.
+const VERSION_PICKER_LIMIT: usize = 40;
+
+/// Switches to the version-picker page and populates it from Mojang's
+/// version manifest, most-recent-release-first.
+fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
+    {
+        let mut data = state.lock().unwrap();
+        data.view = View::VersionPicker;
+    }
+    widgets.stack.set_visible_child_name(view_name(View::VersionPicker));
+    widgets.version_status_label.set_label("Fetching version list...");
+    while let Some(child) = widgets.version_list.first_child() {
+        widgets.version_list.remove(&child);
+    }
+
     let state1 = state.clone();
     let widgets1 = widgets.clone();
     net::spawn_blocking(instance::fetch_version_manifest, move |result| {
@@ -384,36 +407,88 @@ fn start_add_instance(state: Arc<Mutex<AppData>>, widgets: Widgets) {
             Ok(m) => m,
             Err(e) => {
                 widgets1
-                    .home_status_label
+                    .version_status_label
                     .set_label(&format!("Couldn't fetch version list: {e}"));
                 return;
             }
         };
-        let mc_version = manifest.latest.release;
-        let meta = InstanceMeta {
-            id: mc_version.clone(),
-            mc_version,
-            loader: instance::Loader::Fabric,
-            state: InstallState::NotInstalled,
-        };
-        {
-            let mut data = state1.lock().unwrap();
-            if !data.instances.instances.iter().any(|i| i.id == meta.id) {
-                data.instances.instances.push(meta.clone());
-                let _ = data.instances.save();
-            }
+        widgets1
+            .version_status_label
+            .set_label(&format!("{VERSION_PICKER_LIMIT} most recent releases:"));
+
+        let releases = manifest
+            .versions
+            .iter()
+            .filter(|v| v.kind == "release")
+            .take(VERSION_PICKER_LIMIT);
+        for entry in releases {
+            let label = if entry.id == manifest.latest.release {
+                format!("{} (latest)", entry.id)
+            } else {
+                entry.id.clone()
+            };
+            let btn = gtk::Button::with_label(&label);
+            btn.set_css_classes(&["action-button"]);
+
+            let state2 = state1.clone();
+            let widgets2 = widgets1.clone();
+            let mc_version = entry.id.clone();
+            btn.connect_clicked(move |_| {
+                open_or_install_version(state2.clone(), widgets2.clone(), mc_version.clone())
+            });
+            widgets1.version_list.append(&btn);
         }
-        refresh_instance_grid(&state1, &widgets1);
-        start_install(state1.clone(), widgets1.clone(), meta);
+        widgets1.focus_default_for(View::VersionPicker);
     });
 }
 
+/// Adds `mc_version` as a new instance and starts installing it, unless
+/// it's already been added before (installed, failed, or mid-download)
+/// - in which case there's nothing new to do here, so just return to
+/// Home where the existing tile can be played/retried.
+fn open_or_install_version(state: Arc<Mutex<AppData>>, widgets: Widgets, mc_version: String) {
+    let already_added = state
+        .lock()
+        .unwrap()
+        .instances
+        .instances
+        .iter()
+        .any(|i| i.id == mc_version);
+
+    {
+        let mut data = state.lock().unwrap();
+        data.view = View::Home;
+    }
+
+    if already_added {
+        refresh_instance_grid(&state, &widgets);
+        widgets.focus_default_for(View::Home);
+        return;
+    }
+
+    let meta = InstanceMeta {
+        id: mc_version.clone(),
+        mc_version,
+        loader: instance::Loader::Fabric,
+        state: InstallState::NotInstalled,
+    };
+    {
+        let mut data = state.lock().unwrap();
+        data.instances.instances.push(meta.clone());
+        let _ = data.instances.save();
+    }
+    widgets.focus_default_for(View::Home);
+    start_install(state, widgets, meta);
+}
+
 /// Downloads the vanilla client + Fabric Loader + Controlify for
-/// `meta`, updating its `InstallState` and re-rendering the grid when
-/// done. No live progress bar yet (see `instance::install_instance`'s
-/// `on_progress` callback, currently unused here) - just a static
-/// "installing" tile state, which is enough to prove the pipeline works
-/// end-to-end; a progress percentage is a follow-up polish item.
+/// `meta`, updating its `InstallState`, driving `install_progress`, and
+/// re-rendering the grid when done. The progress bar only reflects
+/// `instance::install_instance`'s own byte-level progress (client jar +
+/// libraries + assets, by far the dominant cost); the much smaller
+/// Fabric Loader + Controlify steps that follow aren't individually
+/// tracked, so the bar sits at 100% for the last second or two of a
+/// fresh install.
 fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMeta) {
     {
         let mut data = state.lock().unwrap();
@@ -426,17 +501,26 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
     widgets
         .home_status_label
         .set_label(&format!("Installing Minecraft {}...", meta.mc_version));
+    widgets.install_progress.set_fraction(0.0);
+    widgets.install_progress.set_visible(true);
+
+    let widgets_progress = widgets.clone();
+    let on_progress = move |done: u64, total: u64| {
+        let fraction = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+        widgets_progress.install_progress.set_fraction(fraction.clamp(0.0, 1.0));
+    };
 
     let state2 = state.clone();
     let widgets2 = widgets.clone();
     let meta2 = meta.clone();
-    net::spawn_blocking(
-        move || -> Result<(), HttpError> {
-            instance::install_instance(&meta2, |_, _| {})?;
+    net::spawn_blocking_with_progress(
+        move |report| -> Result<(), HttpError> {
+            instance::install_instance(&meta2, |done, total| report(done, total))?;
             fabric::install_fabric_loader(&meta2)?;
             fabric::inject_controlify_mod(&meta2)?;
             Ok(())
         },
+        on_progress,
         move |result| {
             {
                 let mut data = state2.lock().unwrap();
@@ -449,6 +533,7 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
                 }
                 let _ = data.instances.save();
             }
+            widgets2.install_progress.set_visible(false);
             widgets2.home_status_label.set_label(match &result {
                 Ok(()) => "Install complete.",
                 Err(_) => "Install failed - select the instance to retry.",
@@ -570,7 +655,7 @@ fn handle_gp_back(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
                 widgets.window.close();
             }
         }
-        View::InstanceDetail | View::Accounts | View::Settings => {
+        View::VersionPicker | View::InstanceDetail | View::Accounts | View::Settings => {
             data.view = View::Home;
             drop(data);
             widgets.focus_default_for(View::Home);
@@ -708,10 +793,15 @@ fn build_ui(app: &Application) {
     let home_status_label = gtk::Label::new(None);
     home_page.append(&home_status_label);
 
+    let install_progress = gtk::ProgressBar::new();
+    install_progress.set_size_request(400, -1);
+    install_progress.set_visible(false);
+    home_page.append(&install_progress);
+
     let instance_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
     home_page.append(&instance_list);
 
-    let add_instance_btn = gtk::Button::with_label("Add Instance (latest release)");
+    let add_instance_btn = gtk::Button::with_label("Add Instance");
     add_instance_btn.set_css_classes(&["action-button"]);
     home_page.append(&add_instance_btn);
 
@@ -723,8 +813,33 @@ fn build_ui(app: &Application) {
 
     stack.add_named(&home_page, Some(view_name(View::Home)));
 
+    // ── Version picker page ──
+    let version_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    version_page.set_css_classes(&["page"]);
+    version_page.set_halign(gtk::Align::Center);
+
+    let version_title = gtk::Label::new(Some("Choose a Version"));
+    version_title.set_css_classes(&["game-title"]);
+    version_page.append(&version_title);
+
+    let version_status_label = gtk::Label::new(Some("Fetching version list..."));
+    version_page.append(&version_status_label);
+
+    let version_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let version_scroll = gtk::ScrolledWindow::new();
+    version_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    version_scroll.set_min_content_height(500);
+    version_scroll.set_child(Some(&version_list));
+    version_page.append(&version_scroll);
+
+    let version_hint = gtk::Label::new(Some("A: Select  •  B: Back"));
+    version_hint.set_css_classes(&["control-hint"]);
+    version_page.append(&version_hint);
+
+    stack.add_named(&version_page, Some(view_name(View::VersionPicker)));
+
     // ── Remaining pages: still placeholders (PLAN.md §5 roadmap phases
-    // 3+ - instance grid, account switching, settings) ──
+    // 3+ - per-instance management, account switching, settings) ──
     for view in [View::InstanceDetail, View::Accounts, View::Settings] {
         let placeholder = gtk::Label::new(Some(view_name(view)));
         stack.add_named(&placeholder, Some(view_name(view)));
@@ -751,6 +866,9 @@ fn build_ui(app: &Application) {
         home_status_label,
         instance_list: instance_list.clone(),
         add_instance_btn: add_instance_btn.clone(),
+        install_progress,
+        version_status_label,
+        version_list,
         sound: audio::Player::new(),
         haptics: None,
     };
@@ -787,7 +905,7 @@ fn build_ui(app: &Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         add_instance_btn
-            .connect_clicked(move |_| start_add_instance(state.clone(), widgets.clone()));
+            .connect_clicked(move |_| open_version_picker(state.clone(), widgets.clone()));
     }
     refresh_instance_grid(&state, &widgets);
 
