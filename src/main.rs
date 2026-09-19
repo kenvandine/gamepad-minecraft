@@ -3,17 +3,6 @@
 // Copyright (C) 2026 Ken VanDine
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-mod account;
-mod audio;
-mod auth;
-mod fabric;
-mod haptics;
-mod input;
-mod instance;
-mod launch;
-mod net;
-mod qr;
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -22,6 +11,8 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
+
+use gamepad_minecraft::{account, audio, auth, haptics, input, instance};
 
 use account::AccountStore;
 use input::GamepadAction;

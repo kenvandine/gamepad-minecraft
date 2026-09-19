@@ -37,6 +37,31 @@ cargo build --release
 
 Requires GTK4 development libraries (`libgtk-4-dev` on Debian/Ubuntu).
 
+## Setting up Microsoft sign-in
+
+The device-code sign-in flow needs an Azure AD application ID (a
+`client_id`, not a secret - see below). To register one:
+
+1. [Azure Portal](https://portal.azure.com) → App registrations → New
+   registration.
+2. Supported account types: **Personal Microsoft accounts only** (Xbox
+   Live/Minecraft sign-in only works with personal accounts, and this app
+   talks to the `/consumers/` tenant endpoint specifically).
+3. Authentication → Add a platform → **Mobile and desktop applications**,
+   then set **"Allow public client flows" to Yes**.
+4. Leave *Certificates & secrets* empty. This is a public client - it's
+   shipped as a binary/snap to end users, so it can't keep a secret safe,
+   and the device-code/token endpoints don't require one once step 3 is
+   done. If the portal auto-generates a secret anyway, ignore or delete
+   it; never embed one here.
+
+Then export the resulting application (client) ID and try the auth chain
+standalone, with no GTK/UI involved yet:
+
+```sh
+GAMEPAD_MINECRAFT_CLIENT_ID=<your-app-id> cargo run --example auth_cli
+```
+
 ## Building the snap
 
 ```sh

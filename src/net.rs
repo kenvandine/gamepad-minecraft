@@ -21,6 +21,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct HttpError(pub String);
@@ -65,6 +66,70 @@ pub fn post_form<T: DeserializeOwned>(url: &str, form: &[(&str, &str)]) -> Resul
         .post(url)
         .form(form)
         .send()
+        .map_err(|e| HttpError(e.to_string()))?
+        .json::<T>()
+        .map_err(|e| HttpError(e.to_string()))
+}
+
+/// A response whose status/body the caller needs to inspect itself,
+/// e.g. because a non-2xx response is an expected, meaningful outcome
+/// (device-code polling's "authorization_pending") rather than a plain
+/// error.
+pub struct RawResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// POST `form` and return the raw status/body without treating a non-2xx
+/// status as an error.
+pub fn post_form_raw(url: &str, form: &[(&str, &str)]) -> Result<RawResponse, HttpError> {
+    let response = reqwest::blocking::Client::new()
+        .post(url)
+        .form(form)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|e| HttpError(e.to_string()))?;
+    Ok(RawResponse { status, body })
+}
+
+/// POST a JSON body and return the raw status/body without treating a
+/// non-2xx status as an error.
+pub fn post_json_raw<B: Serialize>(url: &str, body: &B) -> Result<RawResponse, HttpError> {
+    let response = reqwest::blocking::Client::new()
+        .post(url)
+        .header("Accept", "application/json")
+        .json(body)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|e| HttpError(e.to_string()))?;
+    Ok(RawResponse { status, body })
+}
+
+/// POST a JSON body and deserialize the response as `T`. Any non-2xx
+/// status is treated as an error.
+pub fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, HttpError> {
+    reqwest::blocking::Client::new()
+        .post(url)
+        .header("Accept", "application/json")
+        .json(body)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| HttpError(e.to_string()))?
+        .json::<T>()
+        .map_err(|e| HttpError(e.to_string()))
+}
+
+/// GET `url` with a bearer token and deserialize the response as `T`.
+pub fn get_json_bearer<T: DeserializeOwned>(url: &str, bearer: &str) -> Result<T, HttpError> {
+    reqwest::blocking::Client::new()
+        .get(url)
+        .bearer_auth(bearer)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?
+        .error_for_status()
         .map_err(|e| HttpError(e.to_string()))?
         .json::<T>()
         .map_err(|e| HttpError(e.to_string()))
