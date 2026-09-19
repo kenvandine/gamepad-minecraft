@@ -29,8 +29,12 @@ qrcode = { version = "0.14", default-features = false }
 # Extracting LWJGL "natives" jars for the bundled Minecraft instances.
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
-# Verifying downloaded assets against Mojang's version manifest sha1s.
-sha2 = "0.11"
+# Verifying downloaded assets against Mojang's version manifest sha1s
+# (Mojang's manifests use actual SHA-1, not SHA-2 - a real download
+# integrity check, not just a size comparison, is what catches a
+# truncated-but-cleanly-closed transfer that a length check alone
+# would miss less directly).
+sha1 = "0.10"
 
 # Offline-mode UUID derivation (must bit-match Java's
 # UUID.nameUUIDFromBytes for a player name).

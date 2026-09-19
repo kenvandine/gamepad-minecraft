@@ -13,10 +13,11 @@
 //! side and switched between freely; see PLAN.md §5.
 //!
 //! Scope note: this targets modern releases only (roughly 1.17+, the
-//! range Fabric supports and the bundled Java 21 runtime can execute).
-//! Pre-1.13 legacy argument strings and the pre-1.7 "virtual" legacy
-//! assets layout are intentionally not handled - this launcher isn't
-//! trying to be a full historical-version manager.
+//! range Fabric supports and the bundled JRE can execute - see
+//! snapcraft.yaml for which OpenJDK version that currently is). Pre-1.13
+//! legacy argument strings and the pre-1.7 "virtual" legacy assets
+//! layout are intentionally not handled - this launcher isn't trying to
+//! be a full historical-version manager.
 
 use std::collections::HashMap;
 use std::fs;
@@ -322,17 +323,63 @@ impl LaunchProfile {
     }
 }
 
-/// Downloads `entry` to `dest` if it isn't already there with a matching
-/// size (a cheap, good-enough integrity check for skip-if-present;
-/// `sha2` remains available for a stronger check if this ever needs
-/// resuming partial downloads).
-fn ensure_downloaded(entry_url: &str, expected_size: u64, dest: &std::path::Path) -> Result<(), HttpError> {
-    if let Ok(meta) = fs::metadata(dest) {
-        if expected_size == 0 || meta.len() == expected_size {
+const INTEGRITY_MAX_ATTEMPTS: u32 = 3;
+
+/// Downloads `entry` to `dest` unless it's already there with a
+/// matching size *and* SHA-1 hash - a real integrity check, not just a
+/// size comparison. Matters because a transfer that gets cut off by a
+/// cleanly-closed connection (see `net::download_to_file`'s own
+/// truncation check) or plain bit corruption can otherwise produce a
+/// same-length-but-wrong-content file, which then fails mysteriously
+/// much later - deep inside the JVM's own bootstrap, as a corrupted jar
+/// on the classpath - instead of with a clear "bad download" message
+/// right here. Retries a few times on a hash mismatch, since
+/// `download_to_file`'s own retries only cover network/transfer errors,
+/// not "downloaded successfully but wrong."
+fn ensure_downloaded(
+    entry_url: &str,
+    expected_size: u64,
+    expected_sha1: &str,
+    dest: &std::path::Path,
+) -> Result<(), HttpError> {
+    if file_matches(dest, expected_size, expected_sha1) {
+        return Ok(());
+    }
+    let mut last_err = None;
+    for attempt in 1..=INTEGRITY_MAX_ATTEMPTS {
+        crate::net::download_to_file(entry_url, dest, |_, _| {})?;
+        if file_matches(dest, expected_size, expected_sha1) {
             return Ok(());
         }
+        last_err = Some(HttpError(format!(
+            "{} failed its integrity check after downloading (attempt {attempt}/{INTEGRITY_MAX_ATTEMPTS})",
+            dest.display()
+        )));
     }
-    crate::net::download_to_file(entry_url, dest, |_, _| {})
+    Err(last_err.expect("loop always sets last_err before exiting"))
+}
+
+fn file_matches(dest: &std::path::Path, expected_size: u64, expected_sha1: &str) -> bool {
+    let Ok(meta) = fs::metadata(dest) else {
+        return false;
+    };
+    if expected_size != 0 && meta.len() != expected_size {
+        return false;
+    }
+    if expected_sha1.is_empty() {
+        return true;
+    }
+    sha1_hex(dest)
+        .map(|h| h.eq_ignore_ascii_case(expected_sha1))
+        .unwrap_or(false)
+}
+
+fn sha1_hex(path: &std::path::Path) -> Result<String, HttpError> {
+    use sha1::{Digest, Sha1};
+    let bytes = fs::read(path).map_err(|e| HttpError(e.to_string()))?;
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Downloads and installs the client jar, libraries, and assets for
@@ -391,6 +438,7 @@ pub fn install_instance(
     ensure_downloaded(
         &client_manifest.downloads.client.url,
         client_manifest.downloads.client.size,
+        &client_manifest.downloads.client.sha1,
         &client_jar_path,
     )?;
     done += client_manifest.downloads.client.size;
@@ -405,7 +453,7 @@ pub fn install_instance(
         if let Some(artifact) = &lib.downloads.artifact {
             if let Some(rel_path) = &artifact.path {
                 let dest = libraries_dir.join(rel_path);
-                ensure_downloaded(&artifact.url, artifact.size, &dest)?;
+                ensure_downloaded(&artifact.url, artifact.size, &artifact.sha1, &dest)?;
                 done += artifact.size;
                 on_progress(done, total);
                 classpath.push(format!("libraries/{rel_path}"));
@@ -416,7 +464,7 @@ pub fn install_instance(
                 if let Some(artifact) = classifiers.get(key) {
                     if let Some(rel_path) = &artifact.path {
                         let dest = libraries_dir.join(rel_path);
-                        ensure_downloaded(&artifact.url, artifact.size, &dest)?;
+                        ensure_downloaded(&artifact.url, artifact.size, &artifact.sha1, &dest)?;
                         done += artifact.size;
                         on_progress(done, total);
                         natives_jars.push(format!("libraries/{rel_path}"));
@@ -441,7 +489,7 @@ pub fn install_instance(
         let prefix = &object.hash[..2.min(object.hash.len())];
         let dest = assets_dir.join("objects").join(prefix).join(&object.hash);
         let url = format!("https://resources.download.minecraft.net/{prefix}/{}", object.hash);
-        ensure_downloaded(&url, object.size, &dest)?;
+        ensure_downloaded(&url, object.size, &object.hash, &dest)?;
         done += object.size;
         on_progress(done, total);
     }
@@ -482,6 +530,38 @@ mod tests {
     #[test]
     fn new_store_is_empty() {
         assert!(InstanceStore::default().instances.is_empty());
+    }
+
+    #[test]
+    fn sha1_hex_matches_known_value() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-test-sha1-known.txt");
+        fs::write(&path, b"hello world").unwrap();
+        assert_eq!(sha1_hex(&path).unwrap(), "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_rejects_wrong_size() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-test-size.txt");
+        fs::write(&path, b"short").unwrap();
+        assert!(!file_matches(&path, 999, ""));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_rejects_wrong_hash() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-test-hash.txt");
+        fs::write(&path, b"hello world").unwrap();
+        assert!(!file_matches(&path, 0, "0000000000000000000000000000000000000000"));
+        assert!(file_matches(&path, 0, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_missing_file_is_false() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-test-does-not-exist.txt");
+        let _ = fs::remove_file(&path);
+        assert!(!file_matches(&path, 0, ""));
     }
 
     #[test]

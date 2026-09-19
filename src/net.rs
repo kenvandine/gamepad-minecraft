@@ -271,5 +271,19 @@ fn download_to_file_once(
         }
     }
     on_progress(done, total);
+
+    // A connection closed cleanly by the far end mid-transfer (rather
+    // than a hard I/O error) surfaces as `read()` returning 0 early -
+    // exactly like reaching a real end of stream. Without this check
+    // that looked identical to a successful download: a truncated file
+    // got written to disk and reported as `Ok`, only to fail confusingly
+    // much later (a corrupted jar on the classpath produces bizarre,
+    // unrelated-looking JVM bootstrap errors, not a clear "bad download"
+    // message).
+    if total > 0 && done != total {
+        return Err(HttpError(format!(
+            "download truncated: got {done} of {total} expected bytes"
+        )));
+    }
     Ok(())
 }
