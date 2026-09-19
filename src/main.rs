@@ -13,11 +13,12 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
 
-use gamepad_minecraft::{account, audio, auth, haptics, input, instance, net, qr};
+use gamepad_minecraft::{account, audio, auth, fabric, haptics, input, instance, launch, net, qr};
 
-use account::AccountStore;
+use account::{AccountStore, CachedAccount};
 use input::GamepadAction;
-use instance::InstanceStore;
+use instance::{InstallState, InstanceMeta, InstanceStore};
+use net::HttpError;
 
 // ─── Application state ────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,8 @@ struct Widgets {
     play_offline_btn: gtk::Button,
     // Home page
     home_status_label: gtk::Label,
+    instance_list: gtk::Box,
+    add_instance_btn: gtk::Button,
     sound: audio::Player,
     haptics: Option<haptics::Haptics>,
 }
@@ -75,7 +78,11 @@ impl Widgets {
                 }
             }
             View::Home => {
-                self.home_status_label.grab_focus();
+                if let Some(first) = self.instance_list.first_child() {
+                    first.grab_focus();
+                } else {
+                    self.add_instance_btn.grab_focus();
+                }
             }
             _ => {}
         }
@@ -292,6 +299,7 @@ fn go_to_home(state: &Arc<Mutex<AppData>>, widgets: &Widgets, new_auth: auth::Au
         data.view = View::Home;
     }
     render_auth_state(widgets, &new_auth);
+    refresh_instance_grid(state, widgets);
     widgets.focus_default_for(View::Home);
 }
 
@@ -324,6 +332,207 @@ fn start_play_offline(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
         }
     };
     go_to_home(state, widgets, auth::AuthState::OfflinePlaying { profile });
+}
+
+// ─── Instance management & launch ──────────────────────────────────
+// Rebuilds the Home page's instance tiles from `AppData.instances`.
+// Called after every state change that affects the list (install
+// started/finished, launch finished) rather than mutating tiles in
+// place, since the list length itself changes on "Add Instance".
+fn refresh_instance_grid(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    while let Some(child) = widgets.instance_list.first_child() {
+        widgets.instance_list.remove(&child);
+    }
+
+    let instances = state.lock().unwrap().instances.instances.clone();
+    for meta in instances {
+        let label = match meta.state {
+            InstallState::Installed => format!("Play {} (Fabric)", meta.mc_version),
+            InstallState::Downloading => format!("{} — installing...", meta.mc_version),
+            InstallState::Failed => format!("{} — install failed, select to retry", meta.mc_version),
+            InstallState::NotInstalled => format!("{} — not installed", meta.mc_version),
+        };
+        let btn = gtk::Button::with_label(&label);
+        btn.set_css_classes(&["action-button"]);
+        btn.set_sensitive(!matches!(meta.state, InstallState::Downloading));
+
+        let state_for_btn = state.clone();
+        let widgets_for_btn = widgets.clone();
+        let meta_for_btn = meta.clone();
+        btn.connect_clicked(move |_| match meta_for_btn.state {
+            InstallState::Installed => {
+                start_launch_instance(&state_for_btn, &widgets_for_btn, meta_for_btn.clone())
+            }
+            _ => start_install(state_for_btn.clone(), widgets_for_btn.clone(), meta_for_btn.clone()),
+        });
+        widgets.instance_list.append(&btn);
+    }
+}
+
+/// Downloads Mojang's version manifest and starts installing an
+/// instance for the latest release with Fabric + Controlify, the same
+/// way `start_install` retries a failed/not-yet-installed one. A full
+/// version-picker screen (any version, not just latest release) is a
+/// follow-up UI piece, not a blocker for the install/launch pipeline
+/// itself working end-to-end.
+fn start_add_instance(state: Arc<Mutex<AppData>>, widgets: Widgets) {
+    widgets.home_status_label.set_label("Fetching version list...");
+    let state1 = state.clone();
+    let widgets1 = widgets.clone();
+    net::spawn_blocking(instance::fetch_version_manifest, move |result| {
+        let manifest = match result {
+            Ok(m) => m,
+            Err(e) => {
+                widgets1
+                    .home_status_label
+                    .set_label(&format!("Couldn't fetch version list: {e}"));
+                return;
+            }
+        };
+        let mc_version = manifest.latest.release;
+        let meta = InstanceMeta {
+            id: mc_version.clone(),
+            mc_version,
+            loader: instance::Loader::Fabric,
+            state: InstallState::NotInstalled,
+        };
+        {
+            let mut data = state1.lock().unwrap();
+            if !data.instances.instances.iter().any(|i| i.id == meta.id) {
+                data.instances.instances.push(meta.clone());
+                let _ = data.instances.save();
+            }
+        }
+        refresh_instance_grid(&state1, &widgets1);
+        start_install(state1.clone(), widgets1.clone(), meta);
+    });
+}
+
+/// Downloads the vanilla client + Fabric Loader + Controlify for
+/// `meta`, updating its `InstallState` and re-rendering the grid when
+/// done. No live progress bar yet (see `instance::install_instance`'s
+/// `on_progress` callback, currently unused here) - just a static
+/// "installing" tile state, which is enough to prove the pipeline works
+/// end-to-end; a progress percentage is a follow-up polish item.
+fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMeta) {
+    {
+        let mut data = state.lock().unwrap();
+        if let Some(entry) = data.instances.instances.iter_mut().find(|i| i.id == meta.id) {
+            entry.state = InstallState::Downloading;
+        }
+        let _ = data.instances.save();
+    }
+    refresh_instance_grid(&state, &widgets);
+    widgets
+        .home_status_label
+        .set_label(&format!("Installing Minecraft {}...", meta.mc_version));
+
+    let state2 = state.clone();
+    let widgets2 = widgets.clone();
+    let meta2 = meta.clone();
+    net::spawn_blocking(
+        move || -> Result<(), HttpError> {
+            instance::install_instance(&meta2, |_, _| {})?;
+            fabric::install_fabric_loader(&meta2)?;
+            fabric::inject_controlify_mod(&meta2)?;
+            Ok(())
+        },
+        move |result| {
+            {
+                let mut data = state2.lock().unwrap();
+                if let Some(entry) = data.instances.instances.iter_mut().find(|i| i.id == meta.id) {
+                    entry.state = if result.is_ok() {
+                        InstallState::Installed
+                    } else {
+                        InstallState::Failed
+                    };
+                }
+                let _ = data.instances.save();
+            }
+            widgets2.home_status_label.set_label(match &result {
+                Ok(()) => "Install complete.",
+                Err(_) => "Install failed - select the instance to retry.",
+            });
+            if let Err(e) = result {
+                widgets2
+                    .home_status_label
+                    .set_label(&format!("Install failed: {e}"));
+            }
+            refresh_instance_grid(&state2, &widgets2);
+        },
+    );
+}
+
+/// Launches an installed instance. Online sessions need a live Mojang
+/// access token, which isn't cached (only the MSA refresh token is, see
+/// `account.rs`) - so this silently refreshes and redoes the XBL/XSTS/
+/// Mojang exchange first, falling back to an offline-style launch if
+/// that fails, same non-blocking philosophy as PLAN.md §3's silent
+/// refresh.
+fn start_launch_instance(state: &Arc<Mutex<AppData>>, widgets: &Widgets, meta: InstanceMeta) {
+    let (account, refresh_token) = {
+        let data = state.lock().unwrap();
+        let account = match &data.auth {
+            auth::AuthState::LoggedIn { .. } | auth::AuthState::OfflinePlaying { .. } => {
+                data.accounts.active().cloned()
+            }
+            _ => None,
+        };
+        let refresh_token = account.as_ref().and_then(|a| a.refresh_token.clone());
+        (account, refresh_token)
+    };
+    let Some(account) = account else {
+        widgets.home_status_label.set_label("Sign in or play offline first.");
+        return;
+    };
+
+    widgets.home_status_label.set_label("Launching...");
+    match refresh_token {
+        Some(rt) => {
+            let state2 = state.clone();
+            let widgets2 = widgets.clone();
+            let meta2 = meta.clone();
+            let account2 = account.clone();
+            net::spawn_blocking(
+                move || -> Result<auth::MojangSession, HttpError> {
+                    let msa = auth::refresh_silently(&rt)?;
+                    auth::complete_mojang_login(&msa.access_token)
+                },
+                move |result| {
+                    let token = result.ok().map(|s| s.access_token);
+                    do_launch(&state2, &widgets2, meta2, account2, token);
+                },
+            );
+        }
+        None => do_launch(state, widgets, meta, account, None),
+    }
+}
+
+fn do_launch(
+    state: &Arc<Mutex<AppData>>,
+    widgets: &Widgets,
+    meta: InstanceMeta,
+    account: CachedAccount,
+    access_token: Option<String>,
+) {
+    let widgets2 = widgets.clone();
+    let state2 = state.clone();
+    net::spawn_blocking(
+        move || -> Result<(), HttpError> {
+            launch::spawn_minecraft(&meta, &account, access_token.as_deref(), |_event| {})
+                .map_err(HttpError)
+        },
+        move |result| {
+            widgets2.home_status_label.set_label(match &result {
+                Ok(()) => "Minecraft exited.",
+                Err(_) => "Launch failed.",
+            });
+            if let Err(e) = &result {
+                widgets2.home_status_label.set_label(&format!("Launch failed: {e}"));
+            }
+            refresh_instance_grid(&state2, &widgets2);
+        },
+    );
 }
 
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
@@ -497,11 +706,17 @@ fn build_ui(app: &Application) {
     home_page.append(&home_title);
 
     let home_status_label = gtk::Label::new(None);
-    home_status_label.set_can_focus(true);
     home_page.append(&home_status_label);
 
+    let instance_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    home_page.append(&instance_list);
+
+    let add_instance_btn = gtk::Button::with_label("Add Instance (latest release)");
+    add_instance_btn.set_css_classes(&["action-button"]);
+    home_page.append(&add_instance_btn);
+
     let home_hint = gtk::Label::new(Some(
-        "No instances installed yet. B: Quit  •  X: Accounts  •  Y: Settings",
+        "A: Select  •  B: Quit  •  X: Accounts  •  Y: Settings",
     ));
     home_hint.set_css_classes(&["control-hint"]);
     home_page.append(&home_hint);
@@ -534,6 +749,8 @@ fn build_ui(app: &Application) {
         sign_in_btn: sign_in_btn.clone(),
         play_offline_btn: play_offline_btn.clone(),
         home_status_label,
+        instance_list: instance_list.clone(),
+        add_instance_btn: add_instance_btn.clone(),
         sound: audio::Player::new(),
         haptics: None,
     };
@@ -566,6 +783,13 @@ fn build_ui(app: &Application) {
         let widgets = widgets.clone();
         play_offline_btn.connect_clicked(move |_| start_play_offline(&state, &widgets));
     }
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        add_instance_btn
+            .connect_clicked(move |_| start_add_instance(state.clone(), widgets.clone()));
+    }
+    refresh_instance_grid(&state, &widgets);
 
     // ── Keyboard fallback ──
     // Arrow keys drive the same directional focus search as the D-Pad

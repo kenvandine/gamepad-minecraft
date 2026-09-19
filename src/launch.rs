@@ -9,10 +9,13 @@
 //! staged inside the snap and invoked via its full `$SNAP` path — see
 //! PLAN.md §7.
 
+use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use crate::account::CachedAccount;
-use crate::instance::InstanceMeta;
+use crate::instance::{InstanceMeta, InstanceStore, LaunchProfile};
 
 #[derive(Debug, Clone)]
 pub enum LaunchEvent {
@@ -30,45 +33,275 @@ fn java_binary() -> PathBuf {
     }
 }
 
-/// Builds the `-cp` classpath: the instance's client jar plus its
-/// downloaded libraries (and the Fabric loader's own jars, if present).
-pub fn build_classpath(_instance: &InstanceMeta) -> Vec<PathBuf> {
-    // TODO: enumerate instance_dir(&instance.id)/libraries plus the
-    // client jar; include Fabric loader jars when instance.loader is
-    // Loader::Fabric.
-    todo!("enumerate client jar + libraries (+ fabric loader) into a classpath")
+/// Resolves `profile.classpath`'s instance-relative paths to absolute
+/// paths on disk.
+pub fn build_classpath(instance: &InstanceMeta, profile: &LaunchProfile) -> Vec<PathBuf> {
+    let dir = InstanceStore::instance_dir(&instance.id);
+    profile.classpath.iter().map(|rel| dir.join(rel)).collect()
 }
 
-/// Builds the JVM/game argument list, including the account identity.
-/// `account` may be an offline-cached profile — no live Mojang session is
-/// required to launch (see PLAN.md §3).
-pub fn build_jvm_args(_instance: &InstanceMeta, _account: &CachedAccount) -> Vec<String> {
-    // TODO: -Djava.library.path=<extracted natives dir>, -cp <classpath>,
-    // main class, --username/--uuid/--accessToken (or an offline
-    // placeholder token when account.refresh_token is None).
-    todo!("assemble JVM + Minecraft launch arguments")
+fn classpath_string(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
-/// Extracts the LWJGL "natives" jars for this instance's platform into a
-/// per-instance natives directory, referenced by `-Djava.library.path`.
-pub fn extract_natives(_instance: &InstanceMeta) -> Result<PathBuf, String> {
-    // TODO: unzip each *-natives-linux.jar (via the `zip` crate) into
-    // instance_dir(&instance.id)/natives/.
-    todo!("extract natives jars for this instance")
+/// Builds the `${placeholder}` substitution table shared by JVM and
+/// game argument templates. `access_token` is `None` for offline play -
+/// Minecraft doesn't validate it against Mojang for a local/offline
+/// session, so a fixed placeholder is enough (see PLAN.md §3).
+fn substitutions(
+    instance: &InstanceMeta,
+    profile: &LaunchProfile,
+    account: &CachedAccount,
+    access_token: Option<&str>,
+    natives_dir: &std::path::Path,
+    classpath: &str,
+) -> HashMap<&'static str, String> {
+    let mut map = HashMap::new();
+    map.insert("auth_player_name", account.username.clone());
+    map.insert("auth_uuid", account.uuid.clone());
+    map.insert(
+        "auth_access_token",
+        access_token.unwrap_or("0").to_string(),
+    );
+    map.insert("auth_xuid", "0".to_string());
+    map.insert(
+        "user_type",
+        if access_token.is_some() { "msa" } else { "legacy" }.to_string(),
+    );
+    map.insert("version_name", instance.mc_version.clone());
+    map.insert("version_type", "release".to_string());
+    map.insert(
+        "game_directory",
+        InstanceStore::instance_dir(&instance.id).display().to_string(),
+    );
+    map.insert("assets_root", InstanceStore::assets_dir().display().to_string());
+    map.insert("assets_index_name", profile.asset_index_id.clone());
+    map.insert("natives_directory", natives_dir.display().to_string());
+    map.insert("launcher_name", "gamepad-minecraft".to_string());
+    map.insert("launcher_version", env!("CARGO_PKG_VERSION").to_string());
+    map.insert("classpath", classpath.to_string());
+    map.insert("clientid", String::new());
+    map
 }
 
-/// Spawns Minecraft for `instance` as `account`, monitoring the child
-/// process and reporting `LaunchEvent`s via `on_event`. Requires the
-/// `process-control` plug under strict confinement.
+fn substitute(template: &str, map: &HashMap<&str, String>) -> String {
+    let mut out = template.to_string();
+    for (key, value) in map {
+        out = out.replace(&format!("${{{key}}}"), value);
+    }
+    out
+}
+
+/// Builds the JVM argument list (`-Djava.library.path=...`, `-cp`, ...),
+/// with every `${placeholder}` resolved.
+pub fn build_jvm_args(
+    instance: &InstanceMeta,
+    profile: &LaunchProfile,
+    account: &CachedAccount,
+    access_token: Option<&str>,
+    natives_dir: &std::path::Path,
+    classpath: &str,
+) -> Vec<String> {
+    let map = substitutions(instance, profile, account, access_token, natives_dir, classpath);
+    profile
+        .jvm_arg_templates
+        .iter()
+        .map(|t| substitute(t, &map))
+        .collect()
+}
+
+/// Builds the game argument list (`--username`, `--uuid`, ...), with
+/// every `${placeholder}` resolved.
+pub fn build_game_args(
+    instance: &InstanceMeta,
+    profile: &LaunchProfile,
+    account: &CachedAccount,
+    access_token: Option<&str>,
+    natives_dir: &std::path::Path,
+    classpath: &str,
+) -> Vec<String> {
+    let map = substitutions(instance, profile, account, access_token, natives_dir, classpath);
+    profile
+        .game_arg_templates
+        .iter()
+        .map(|t| substitute(t, &map))
+        .collect()
+}
+
+/// Extracts every native-library jar recorded in `profile.natives_jars`
+/// (`.so` files, mainly LWJGL) into a per-instance natives directory,
+/// referenced by `-Djava.library.path`. Leftover non-native entries
+/// (e.g. `META-INF/MANIFEST.MF`) land alongside them harmlessly - the
+/// JVM's native loader only looks for the specific `.so` filenames it
+/// wants.
+pub fn extract_natives(instance: &InstanceMeta, profile: &LaunchProfile) -> Result<PathBuf, String> {
+    let instance_dir = InstanceStore::instance_dir(&instance.id);
+    let natives_dir = instance_dir.join("natives");
+    std::fs::create_dir_all(&natives_dir).map_err(|e| e.to_string())?;
+
+    for rel in &profile.natives_jars {
+        let jar_path = instance_dir.join(rel);
+        let file = File::open(&jar_path).map_err(|e| format!("{}: {e}", jar_path.display()))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        archive.extract(&natives_dir).map_err(|e| e.to_string())?;
+    }
+    Ok(natives_dir)
+}
+
+/// Spawns Minecraft for `instance` as `account` and blocks until it
+/// exits, reporting `LaunchEvent`s via `on_event` (`Started` once the
+/// process is up, then `Exited`/`Crashed` when it's done). Meant to be
+/// called from a background thread the same way `net::spawn_blocking`'s
+/// job closures are - this function itself does not spawn one.
+/// `access_token` is `None` for offline play.
 pub fn spawn_minecraft(
-    _instance: &InstanceMeta,
-    _account: &CachedAccount,
-    _on_event: impl FnMut(LaunchEvent) + Send + 'static,
+    instance: &InstanceMeta,
+    account: &CachedAccount,
+    access_token: Option<&str>,
+    mut on_event: impl FnMut(LaunchEvent),
 ) -> Result<(), String> {
-    let _ = java_binary();
-    // TODO: std::process::Command::new(java_binary()).args(build_jvm_args
-    // (..)).spawn(), then wait() on a background thread and forward
-    // LaunchEvent::Exited/Crashed via on_event (bridged to the GTK main
-    // loop the same way as net.rs::spawn_blocking).
-    todo!("spawn and monitor the java child process")
+    let profile = LaunchProfile::load(&instance.id)
+        .map_err(|e| format!("instance is not installed yet: {e}"))?;
+
+    let natives_dir = extract_natives(instance, &profile)?;
+    let classpath_paths = build_classpath(instance, &profile);
+    let classpath = classpath_string(&classpath_paths);
+
+    let jvm_args = build_jvm_args(instance, &profile, account, access_token, &natives_dir, &classpath);
+    let game_args = build_game_args(instance, &profile, account, access_token, &natives_dir, &classpath);
+
+    let mut command = Command::new(java_binary());
+    command
+        .current_dir(InstanceStore::instance_dir(&instance.id))
+        .args(&jvm_args)
+        .arg(&profile.main_class)
+        .args(&game_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    on_event(LaunchEvent::Started);
+
+    match child.wait() {
+        Ok(status) => match status.code() {
+            Some(code) => on_event(LaunchEvent::Exited(code)),
+            None => on_event(LaunchEvent::Crashed(
+                "process terminated by a signal".to_string(),
+            )),
+        },
+        Err(e) => on_event(LaunchEvent::Crashed(e.to_string())),
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::{InstallState, Loader};
+
+    fn test_instance() -> InstanceMeta {
+        InstanceMeta {
+            id: "test".to_string(),
+            mc_version: "1.21".to_string(),
+            loader: Loader::Fabric,
+            state: InstallState::Installed,
+        }
+    }
+
+    fn test_profile() -> LaunchProfile {
+        LaunchProfile {
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            classpath: vec!["client.jar".to_string()],
+            natives_jars: vec![],
+            jvm_arg_templates: vec![
+                "-Djava.library.path=${natives_directory}".to_string(),
+                "-cp".to_string(),
+                "${classpath}".to_string(),
+            ],
+            game_arg_templates: vec![
+                "--username".to_string(),
+                "${auth_player_name}".to_string(),
+                "--uuid".to_string(),
+                "${auth_uuid}".to_string(),
+                "--accessToken".to_string(),
+                "${auth_access_token}".to_string(),
+            ],
+            asset_index_id: "17".to_string(),
+        }
+    }
+
+    fn test_account() -> CachedAccount {
+        CachedAccount {
+            username: "Steve".to_string(),
+            uuid: "abc123".to_string(),
+            refresh_token: None,
+            obtained_at: "2026-01-01".to_string(),
+        }
+    }
+
+    #[test]
+    fn game_args_substitute_identity() {
+        let instance = test_instance();
+        let profile = test_profile();
+        let account = test_account();
+        let args = build_game_args(
+            &instance,
+            &profile,
+            &account,
+            None,
+            std::path::Path::new("/tmp/natives"),
+            "cp",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--username", "Steve", "--uuid", "abc123", "--accessToken", "0",
+            ]
+        );
+    }
+
+    #[test]
+    fn jvm_args_substitute_classpath_and_natives() {
+        let instance = test_instance();
+        let profile = test_profile();
+        let account = test_account();
+        let args = build_jvm_args(
+            &instance,
+            &profile,
+            &account,
+            Some("real-token"),
+            std::path::Path::new("/tmp/natives"),
+            "/a.jar:/b.jar",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-Djava.library.path=/tmp/natives".to_string(),
+                "-cp".to_string(),
+                "/a.jar:/b.jar".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn online_access_token_is_used_when_present() {
+        let instance = test_instance();
+        let profile = test_profile();
+        let account = test_account();
+        let args = build_game_args(
+            &instance,
+            &profile,
+            &account,
+            Some("real-token"),
+            std::path::Path::new("/tmp"),
+            "cp",
+        );
+        assert!(args.contains(&"real-token".to_string()));
+    }
 }

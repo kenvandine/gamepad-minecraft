@@ -37,6 +37,8 @@ apps:
       - desktop-legacy
       - process-control    # spawn/monitor the bundled java child process
       - removable-media    # reserved for storing instances on a MicroSD card
+    environment:
+      HOME: $SNAP_USER_COMMON
 
 parts:
   gamepad-minecraft:
