@@ -24,11 +24,14 @@ pub enum LaunchEvent {
     Crashed(String),
 }
 
-/// Path to the JRE staged inside the snap. Falls back to a bare `java`
-/// lookup on `$PATH` when not running under snap confinement (local dev).
+/// Path to the JRE staged inside the snap (see snapcraft.yaml for why
+/// this tracks the current OpenJDK LTS rather than a fixed old
+/// version - current Minecraft releases use JVM arguments older JDKs
+/// don't recognize at all). Falls back to a bare `java` lookup on
+/// `$PATH` when not running under snap confinement (local dev).
 fn java_binary() -> PathBuf {
     match std::env::var("SNAP") {
-        Ok(snap) => PathBuf::from(snap).join("usr/lib/jvm/java-21-openjdk-amd64/bin/java"),
+        Ok(snap) => PathBuf::from(snap).join("usr/lib/jvm/java-25-openjdk-amd64/bin/java"),
         Err(_) => PathBuf::from("java"),
     }
 }

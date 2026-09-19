@@ -213,10 +213,15 @@ toolchain). New plugs beyond gamepad-2048's set, and why:
 - **`removable-media`** — reserved for storing instances on a MicroSD card,
   not wired up in v1.
 
-OpenJDK 21 is staged inside the snap (`openjdk-21-jre-headless`) because
-strict confinement forbids exec'ing arbitrary host binaries — `launch.rs`
-invokes `$SNAP/usr/lib/jvm/java-21-openjdk-amd64/bin/java` directly, the
-same pattern the original draft of this plan already got right.
+The current OpenJDK LTS is staged inside the snap
+(`openjdk-25-jre-headless` as of writing) because strict confinement
+forbids exec'ing arbitrary host binaries — `launch.rs` invokes
+`$SNAP/usr/lib/jvm/java-25-openjdk-amd64/bin/java` directly, the same
+pattern the original draft of this plan already got right. Track the
+current LTS, not a fixed version: current Minecraft releases pass JVM
+arguments (e.g. `--sun-misc-unsafe-memory-access=allow`) that older JDKs
+don't recognize at all and refuse to start with — this was hit and fixed
+against Java 21 during development.
 
 The `joystick` interface doesn't auto-connect on the Snap Store by
 default — filing an auto-connect request on `forum.snapcraft.io` is a

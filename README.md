@@ -72,7 +72,8 @@ sudo snap connect gamepad-minecraft:joystick
 
 The snap is strictly confined and uses the GNOME extension for desktop
 integration, plus the `joystick` interface for game-controller input and
-a staged OpenJDK 21 runtime to launch Minecraft itself.
+a staged OpenJDK runtime (currently 25, tracking the OpenJDK LTS current
+Minecraft releases expect) to launch Minecraft itself.
 
 ## License
 

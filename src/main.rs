@@ -789,6 +789,33 @@ fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     widgets.focus_default_for(View::Settings);
 }
 
+/// Moves focus to the previous/next sibling of whatever's currently
+/// focused, instead of GTK's generic geometric `child_focus` search
+/// (PLAN.md §5, lesson 4). That search is unreliable across a tall
+/// stack of same-sized buttons - the exact bug gamepad-2048 hit for its
+/// board-size row - and manifests here on any of the longer lists
+/// (version picker, instance grid, accounts, settings): Up/Down would
+/// unpredictably skip several rows at once instead of moving one at a
+/// time. Every screen here lays its focusable controls out as flat
+/// siblings in a single vertical `gtk::Box`, so "the literal next/
+/// previous sibling" is exactly "the next item down/up" - this needs no
+/// per-screen knowledge of which list is active. Deliberately doesn't
+/// wrap at the ends, same as gamepad-2048's own documented behavior.
+fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
+    let Some(focused) = gtk::prelude::RootExt::focus(window) else {
+        return false;
+    };
+    let next = if forward {
+        focused.next_sibling()
+    } else {
+        focused.prev_sibling()
+    };
+    match next {
+        Some(widget) => widget.grab_focus(),
+        None => false,
+    }
+}
+
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
 // Confirm always activates whatever GTK reports as focused - never a
 // per-screen hardcoded action derived from AppData - so the highlighted
@@ -1161,8 +1188,8 @@ fn build_ui(app: &Application) {
     key_controller.connect_key_pressed(move |_, key, _, _| {
         use gtk::gdk::Key;
         match key {
-            Key::Up => widgets_kb.window.child_focus(gtk::DirectionType::Up),
-            Key::Down => widgets_kb.window.child_focus(gtk::DirectionType::Down),
+            Key::Up => step_focus(&widgets_kb.window, false),
+            Key::Down => step_focus(&widgets_kb.window, true),
             Key::Left => widgets_kb.window.child_focus(gtk::DirectionType::Left),
             Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
             Key::Escape => {
@@ -1206,10 +1233,10 @@ fn build_ui(app: &Application) {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
                         gilrs::Button::DPadUp => {
-                            widgets_for_gp.window.child_focus(gtk::DirectionType::Up);
+                            step_focus(&widgets_for_gp.window, false);
                         }
                         gilrs::Button::DPadDown => {
-                            widgets_for_gp.window.child_focus(gtk::DirectionType::Down);
+                            step_focus(&widgets_for_gp.window, true);
                         }
                         gilrs::Button::DPadLeft => {
                             widgets_for_gp.window.child_focus(gtk::DirectionType::Left);

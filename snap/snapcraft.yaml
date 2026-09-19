@@ -57,12 +57,17 @@ parts:
   jre:
     plugin: nil
     stage-packages:
-      - openjdk-21-jre-headless
+      # Current Minecraft releases ship JVM arguments newer JDKs
+      # introduced (e.g. --sun-misc-unsafe-memory-access=allow, part of
+      # the sun.misc.Unsafe deprecation work) that Java 21 doesn't
+      # recognize at all and refuses to start with. Track the current
+      # OpenJDK LTS rather than pinning to 21.
+      - openjdk-25-jre-headless
     # Strict confinement forbids exec'ing arbitrary host binaries, so the
     # JRE is staged inside the snap; launch.rs invokes
-    # $SNAP/usr/lib/jvm/java-21-openjdk-amd64/bin/java directly.
+    # $SNAP/usr/lib/jvm/java-25-openjdk-amd64/bin/java directly.
     prime:
-      - usr/lib/jvm/java-21-openjdk-amd64
+      - usr/lib/jvm/java-25-openjdk-amd64
 
   data:
     plugin: dump
