@@ -80,15 +80,12 @@ pub struct InstanceStore {
 }
 
 impl InstanceStore {
+    /// See `crate::paths` for why this is `$SNAP_USER_COMMON`, not
+    /// `$SNAP_USER_DATA` (the latter is versioned per snap revision,
+    /// which would orphan every previously-downloaded instance on
+    /// each refresh).
     fn data_dir() -> PathBuf {
-        let dir = std::env::var("SNAP_USER_DATA")
-            .or_else(|_| std::env::var("XDG_DATA_HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_default();
-                PathBuf::from(format!("{}/.local/share", home))
-            });
-        dir.join("gamepad-minecraft")
+        crate::paths::data_root()
     }
 
     fn store_path() -> PathBuf {
@@ -359,6 +356,14 @@ pub fn install_instance(
         .ok_or_else(|| HttpError(format!("unknown Minecraft version {}", meta.mc_version)))?;
     let client_manifest: ClientManifest = crate::net::get_json(&entry.url)?;
 
+    // Fetched here (not down at step 4, where it's used) specifically
+    // so its object sizes can go into `total` up front - assets are the
+    // overwhelming majority of a real install's bytes. Computing `total`
+    // without them let `done` catch up to (and exceed) it the moment
+    // asset downloading started, pinning the progress bar at 100% for
+    // what's actually the largest and slowest phase.
+    let asset_index: AssetIndexFile = crate::net::get_json(&client_manifest.asset_index.url)?;
+
     let mut total = client_manifest.downloads.client.size;
     let allowed_libraries: Vec<&Library> = client_manifest
         .libraries
@@ -377,6 +382,7 @@ pub fn install_instance(
             }
         }
     }
+    total += asset_index.objects.values().map(|o| o.size).sum::<u64>();
 
     // 2. Client jar.
     let client_jar_rel = "client.jar";
@@ -420,8 +426,8 @@ pub fn install_instance(
         }
     }
 
-    // 4. Asset index + objects, shared across instances by hash.
-    let asset_index: AssetIndexFile = crate::net::get_json(&client_manifest.asset_index.url)?;
+    // 4. Asset objects, shared across instances by hash (the index
+    // itself was already fetched above, to compute `total`).
     let assets_dir = InstanceStore::assets_dir();
     fs::create_dir_all(assets_dir.join("indexes")).map_err(|e| HttpError(e.to_string()))?;
     fs::write(

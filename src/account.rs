@@ -34,17 +34,10 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
-    /// Directory for storing account data. Snap sets `$SNAP_USER_DATA`;
-    /// falls back to `$XDG_DATA_HOME`/`~/.local/share` off-snap.
+    /// Directory for storing account data. See `crate::paths` for why
+    /// this is `$SNAP_USER_COMMON`, not `$SNAP_USER_DATA`.
     fn data_dir() -> PathBuf {
-        let dir = std::env::var("SNAP_USER_DATA")
-            .or_else(|_| std::env::var("XDG_DATA_HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_default();
-                PathBuf::from(format!("{}/.local/share", home))
-            });
-        dir.join("gamepad-minecraft")
+        crate::paths::data_root()
     }
 
     fn store_path() -> PathBuf {

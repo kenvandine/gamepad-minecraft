@@ -31,7 +31,7 @@ Flat `src/`, one binary crate, no workspace — same shape as gamepad-2048:
 | `input.rs` | The **only** gamepad button→action mapping table (`classify_button`). gamepad-2048 shipped a second, unused copy of this in its own `gamepad.rs` while `main.rs` reimplemented the mapping inline — `input.rs` is designed so that mistake can't happen here: nothing matches on `gilrs::Button` except this one function. |
 | `net.rs` | Background-thread + `async-channel` bridge to the GTK main loop (`spawn_blocking`), plus thin `reqwest::blocking` helpers (`get_json`, `post_form`, `download_to_file`). No GTK dependency. |
 | `auth.rs` | RFC 8628 device-code flow, MSA → XBL → XSTS → Mojang token exchange, the `AuthState`/`AuthEvent` state machine (online login vs. cached offline play — see §3). HTTP calls delegate to `net.rs`; the state machine itself is unit-testable in isolation, same as gamepad-2048's `game.rs`. |
-| `account.rs` | Cached-account JSON store (`$SNAP_USER_DATA/accounts.json`), structured identically to gamepad-2048's `scores.rs`: silent empty-default on a missing/corrupt file, never panics. |
+| `account.rs` | Cached-account JSON store (`$SNAP_USER_COMMON/gamepad-minecraft/accounts.json`), structured identically to gamepad-2048's `scores.rs`: silent empty-default on a missing/corrupt file, never panics. |
 | `qr.rs` | Renders the device-code verification URI into an RGBA pixel buffer using the `qrcode` crate directly — no external `qrencode` binary, no `image` crate. `main.rs` wraps the buffer in a `gdk::MemoryTexture`. |
 | `instance.rs` | Mojang version-manifest fetch, the installed-instance list (multiple versions side by side, switchable — see §5), download/verify orchestration. Persisted the same way as `account.rs`/`scores.rs`. |
 | `fabric.rs` | Fabric Loader install and Controlify mod auto-injection into a new instance's `mods/`, so Minecraft's own title screen is gamepad-navigable too. |
@@ -177,18 +177,23 @@ its own `docs/UX_REVIEW.md`, the same artifact gamepad-2048 produced.
 
 ## 6. Account storage
 
-`account.rs` writes `$SNAP_USER_DATA/accounts.json` with `0600`
-permissions. Deliberately **not** encrypted at rest in v1: the cached token
-is scoped to `XboxLive.signin offline_access` (not a full account
-credential) and is remotely revocable from the user's Microsoft account;
-real at-rest encryption would need a secret store
+`account.rs` writes `$SNAP_USER_COMMON/gamepad-minecraft/accounts.json`
+with `0600` permissions — `$SNAP_USER_COMMON`, not the more commonly
+reached-for `$SNAP_USER_DATA`, because the latter is versioned per snap
+revision (`~/snap/<name>/<revision>/`) and would orphan every
+previously-downloaded instance and cached account on each refresh (see
+`paths.rs`; the same directory is used for installed instances and
+assets, not just accounts). Deliberately **not** encrypted at rest in
+v1: the cached token is scoped to `XboxLive.signin offline_access` (not
+a full account credential) and is remotely revocable from the user's
+Microsoft account; real at-rest encryption would need a secret store
 (`org.freedesktop.secrets` over D-Bus), which strict-confinement snaps
 don't get cleanly, and gamepad-2048's own precedent
 (`PULSE_AUTOSPAWN=0`, avoiding D-Bus session activation) argues against
-adding a D-Bus dependency for this. The real security boundary is the snap
-sandbox itself — `$SNAP_USER_DATA` isn't readable by other confined snaps —
-the same trust model the official launcher relies on. An `oo7`/libsecret
-store is a reasonable fast-follow, not a v1 blocker.
+adding a D-Bus dependency for this. The real security boundary is the
+snap sandbox itself — this directory isn't readable by other confined
+snaps — the same trust model the official launcher relies on. An
+`oo7`/libsecret store is a reasonable fast-follow, not a v1 blocker.
 
 ## 7. Snap packaging
 
