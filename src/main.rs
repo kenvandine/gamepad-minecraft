@@ -64,6 +64,11 @@ struct Widgets {
     // Version picker page
     version_status_label: gtk::Label,
     version_list: gtk::Box,
+    // Accounts page
+    accounts_list: gtk::Box,
+    add_account_btn: gtk::Button,
+    // Settings page
+    settings_list: gtk::Box,
     sound: audio::Player,
     haptics: Option<haptics::Haptics>,
 }
@@ -94,9 +99,28 @@ impl Widgets {
                     first.grab_focus();
                 }
             }
+            View::Accounts => {
+                if let Some(first) = self.accounts_list.first_child() {
+                    first.grab_focus();
+                } else {
+                    self.add_account_btn.grab_focus();
+                }
+            }
+            View::Settings => {
+                if let Some(first) = self.settings_list.first_child() {
+                    first.grab_focus();
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// X (Accounts) and Y (Settings) are Home-level shortcuts (PLAN.md §5's
+/// face-button scheme) - guarding on this avoids e.g. X popping open
+/// Accounts mid-QR-code sign-in.
+fn is_on_home(state: &Arc<Mutex<AppData>>) -> bool {
+    state.lock().unwrap().view == View::Home
 }
 
 fn view_name(view: View) -> &'static str {
@@ -620,6 +644,127 @@ fn do_launch(
     );
 }
 
+// ─── Accounts ───────────────────────────────────────────────────────
+// Switching or adding an account is Home-adjacent, not its own auth
+// flow: switching just re-points AppData.accounts.active_uuid and
+// derives an optimistic AuthState from the cached entry (no network
+// call - matches PLAN.md §3's "Home renders immediately from cache").
+// Adding another Microsoft account reuses the exact same Login-page
+// device-code flow, just entered from here instead of a fresh launch.
+fn refresh_accounts_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    while let Some(child) = widgets.accounts_list.first_child() {
+        widgets.accounts_list.remove(&child);
+    }
+
+    let (accounts, active_uuid) = {
+        let data = state.lock().unwrap();
+        (data.accounts.accounts.clone(), data.accounts.active_uuid.clone())
+    };
+    for acc in accounts {
+        let is_active = active_uuid.as_deref() == Some(acc.uuid.as_str());
+        let kind = if acc.refresh_token.is_some() { "Microsoft" } else { "Offline" };
+        let label = if is_active {
+            format!("{} ({kind}) — Active", acc.username)
+        } else {
+            format!("Switch to {} ({kind})", acc.username)
+        };
+        let btn = gtk::Button::with_label(&label);
+        btn.set_css_classes(&["action-button"]);
+        btn.set_sensitive(!is_active);
+
+        let state_for_btn = state.clone();
+        let widgets_for_btn = widgets.clone();
+        let uuid = acc.uuid.clone();
+        btn.connect_clicked(move |_| switch_active_account(&state_for_btn, &widgets_for_btn, uuid.clone()));
+        widgets.accounts_list.append(&btn);
+    }
+}
+
+fn switch_active_account(state: &Arc<Mutex<AppData>>, widgets: &Widgets, uuid: String) {
+    let new_auth = {
+        let mut data = state.lock().unwrap();
+        data.accounts.active_uuid = Some(uuid);
+        let _ = data.accounts.save();
+        let auth_state = match data.accounts.active() {
+            Some(account) if account.refresh_token.is_some() => auth::AuthState::LoggedIn {
+                profile: auth::McProfile {
+                    id: account.uuid.clone(),
+                    name: account.username.clone(),
+                },
+            },
+            Some(account) => auth::AuthState::OfflinePlaying {
+                profile: account.clone(),
+            },
+            None => auth::AuthState::NeedsLogin { cached: None },
+        };
+        data.auth = auth_state.clone();
+        data.view = View::Home;
+        auth_state
+    };
+    render_auth_state(widgets, &new_auth);
+    refresh_instance_grid(state, widgets);
+    widgets.focus_default_for(View::Home);
+}
+
+/// Opens the same device-code sign-in flow the Login page uses,
+/// entered from Accounts instead of a fresh launch - a second
+/// successful sign-in just adds another cached account rather than
+/// replacing the current one (`account::AccountStore::upsert` keys on
+/// UUID).
+fn start_add_account(state: Arc<Mutex<AppData>>, widgets: Widgets) {
+    {
+        let mut data = state.lock().unwrap();
+        data.view = View::Login;
+    }
+    widgets.stack.set_visible_child_name(view_name(View::Login));
+    start_sign_in(state, widgets);
+}
+
+fn open_accounts(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    state.lock().unwrap().view = View::Accounts;
+    refresh_accounts_list(state, widgets);
+    widgets.focus_default_for(View::Accounts);
+}
+
+// ─── Settings ───────────────────────────────────────────────────────
+// The one setting worth exposing right now: freeing disk space by
+// deleting an installed instance. There was previously no way to do
+// this at all once an instance was added.
+fn refresh_settings_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    while let Some(child) = widgets.settings_list.first_child() {
+        widgets.settings_list.remove(&child);
+    }
+
+    let instances = state.lock().unwrap().instances.instances.clone();
+    for meta in instances {
+        let btn = gtk::Button::with_label(&format!("Delete {} (Fabric)", meta.mc_version));
+        btn.set_css_classes(&["action-button"]);
+
+        let state_for_btn = state.clone();
+        let widgets_for_btn = widgets.clone();
+        let id = meta.id.clone();
+        btn.connect_clicked(move |_| delete_instance(&state_for_btn, &widgets_for_btn, id.clone()));
+        widgets.settings_list.append(&btn);
+    }
+}
+
+fn delete_instance(state: &Arc<Mutex<AppData>>, widgets: &Widgets, id: String) {
+    {
+        let mut data = state.lock().unwrap();
+        data.instances.instances.retain(|i| i.id != id);
+        let _ = data.instances.save();
+    }
+    let _ = std::fs::remove_dir_all(InstanceStore::instance_dir(&id));
+    refresh_settings_list(state, widgets);
+    widgets.focus_default_for(View::Settings);
+}
+
+fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    state.lock().unwrap().view = View::Settings;
+    refresh_settings_list(state, widgets);
+    widgets.focus_default_for(View::Settings);
+}
+
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
 // Confirm always activates whatever GTK reports as focused - never a
 // per-screen hardcoded action derived from AppData - so the highlighted
@@ -838,9 +983,61 @@ fn build_ui(app: &Application) {
 
     stack.add_named(&version_page, Some(view_name(View::VersionPicker)));
 
-    // ── Remaining pages: still placeholders (PLAN.md §5 roadmap phases
-    // 3+ - per-instance management, account switching, settings) ──
-    for view in [View::InstanceDetail, View::Accounts, View::Settings] {
+    // ── Accounts page ──
+    let accounts_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    accounts_page.set_css_classes(&["page"]);
+    accounts_page.set_halign(gtk::Align::Center);
+
+    let accounts_title = gtk::Label::new(Some("Accounts"));
+    accounts_title.set_css_classes(&["game-title"]);
+    accounts_page.append(&accounts_title);
+
+    let accounts_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let accounts_scroll = gtk::ScrolledWindow::new();
+    accounts_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    accounts_scroll.set_min_content_height(300);
+    accounts_scroll.set_child(Some(&accounts_list));
+    accounts_page.append(&accounts_scroll);
+
+    let add_account_btn = gtk::Button::with_label("Sign in with another Microsoft account");
+    add_account_btn.set_css_classes(&["action-button"]);
+    accounts_page.append(&add_account_btn);
+
+    let accounts_hint = gtk::Label::new(Some("A: Switch  •  B: Back"));
+    accounts_hint.set_css_classes(&["control-hint"]);
+    accounts_page.append(&accounts_hint);
+
+    stack.add_named(&accounts_page, Some(view_name(View::Accounts)));
+
+    // ── Settings page ──
+    let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    settings_page.set_css_classes(&["page"]);
+    settings_page.set_halign(gtk::Align::Center);
+
+    let settings_title = gtk::Label::new(Some("Settings"));
+    settings_title.set_css_classes(&["game-title"]);
+    settings_page.append(&settings_title);
+
+    let settings_subtitle = gtk::Label::new(Some("Installed instances"));
+    settings_subtitle.set_css_classes(&["control-hint"]);
+    settings_page.append(&settings_subtitle);
+
+    let settings_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let settings_scroll = gtk::ScrolledWindow::new();
+    settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    settings_scroll.set_min_content_height(300);
+    settings_scroll.set_child(Some(&settings_list));
+    settings_page.append(&settings_scroll);
+
+    let settings_hint = gtk::Label::new(Some("A: Delete  •  B: Back"));
+    settings_hint.set_css_classes(&["control-hint"]);
+    settings_page.append(&settings_hint);
+
+    stack.add_named(&settings_page, Some(view_name(View::Settings)));
+
+    // ── Remaining pages: still placeholders (PLAN.md §5 roadmap phase 3+
+    // - per-instance management) ──
+    for view in [View::InstanceDetail] {
         let placeholder = gtk::Label::new(Some(view_name(view)));
         stack.add_named(&placeholder, Some(view_name(view)));
     }
@@ -869,6 +1066,9 @@ fn build_ui(app: &Application) {
         install_progress,
         version_status_label,
         version_list,
+        accounts_list: accounts_list.clone(),
+        add_account_btn: add_account_btn.clone(),
+        settings_list,
         sound: audio::Player::new(),
         haptics: None,
     };
@@ -907,6 +1107,12 @@ fn build_ui(app: &Application) {
         add_instance_btn
             .connect_clicked(move |_| open_version_picker(state.clone(), widgets.clone()));
     }
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        add_account_btn
+            .connect_clicked(move |_| start_add_account(state.clone(), widgets.clone()));
+    }
     refresh_instance_grid(&state, &widgets);
 
     // ── Keyboard fallback ──
@@ -926,6 +1132,14 @@ fn build_ui(app: &Application) {
             Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
             Key::Escape => {
                 handle_gp_back(&state_kb, &widgets_kb);
+                true
+            }
+            Key::x | Key::X if is_on_home(&state_kb) => {
+                open_accounts(&state_kb, &widgets_kb);
+                true
+            }
+            Key::y | Key::Y if is_on_home(&state_kb) => {
+                open_settings(&state_kb, &widgets_kb);
                 true
             }
             _ => false,
@@ -975,9 +1189,14 @@ fn build_ui(app: &Application) {
                             Some(GamepadAction::Back) => {
                                 handle_gp_back(&state_for_gp, &widgets_for_gp)
                             }
-                            // TODO: OpenAccounts / RefreshOrSettings / SystemMenu
-                            // dispatch once the Accounts/Settings pages are
-                            // built out.
+                            Some(GamepadAction::OpenAccounts) if is_on_home(&state_for_gp) => {
+                                open_accounts(&state_for_gp, &widgets_for_gp)
+                            }
+                            Some(GamepadAction::RefreshOrSettings) if is_on_home(&state_for_gp) => {
+                                open_settings(&state_for_gp, &widgets_for_gp)
+                            }
+                            // TODO: SystemMenu (Start button power/system
+                            // overlay) once that screen exists.
                             _ => {}
                         },
                     }
