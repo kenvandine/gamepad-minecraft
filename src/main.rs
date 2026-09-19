@@ -1220,6 +1220,16 @@ fn build_ui(app: &Application) {
         let gilrs = Rc::new(RefCell::new(gilrs));
         let state_for_gp = state.clone();
         let widgets_for_gp = widgets.clone();
+        // A physical D-Pad press can arrive as more than one discrete
+        // `ButtonPressed` event - mechanical switch bounce, or a
+        // controller/driver that reports a brief repeat stream rather
+        // than a single clean edge. Every one of those is a perfectly
+        // valid single-step move on its own, so without a cooldown a
+        // single tap could step several rows at once, which is exactly
+        // what "skips big chunks" looks like even though each
+        // individual `step_focus` call only ever moves one row.
+        const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(160);
+        let mut last_dpad_nav = std::time::Instant::now() - DPAD_NAV_DEBOUNCE;
         glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let events: Vec<gilrs::Event> = {
                 let mut gp = gilrs.borrow_mut();
@@ -1232,11 +1242,12 @@ fn build_ui(app: &Application) {
             for gilrs::Event { event, .. } in events {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
-                        gilrs::Button::DPadUp => {
-                            step_focus(&widgets_for_gp.window, false);
-                        }
-                        gilrs::Button::DPadDown => {
-                            step_focus(&widgets_for_gp.window, true);
+                        gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
+                            if last_dpad_nav.elapsed() < DPAD_NAV_DEBOUNCE {
+                                continue;
+                            }
+                            last_dpad_nav = std::time::Instant::now();
+                            step_focus(&widgets_for_gp.window, button == gilrs::Button::DPadDown);
                         }
                         gilrs::Button::DPadLeft => {
                             widgets_for_gp.window.child_focus(gtk::DirectionType::Left);
