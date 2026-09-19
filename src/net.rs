@@ -32,6 +32,32 @@ impl std::fmt::Display for HttpError {
     }
 }
 
+/// A client for small, bounded requests (auth exchanges, manifest
+/// fetches). `reqwest` sets no timeout at all by default, so a stalled
+/// connection - a dropped packet an intermediate hop never resets, a
+/// server that accepts the connection but never replies - hangs the
+/// request forever instead of failing. That turns into a silent,
+/// indefinite freeze anywhere this is awaited from a poll loop (e.g.
+/// `auth::poll_for_token`), with no error to report and nothing for the
+/// caller to react to.
+fn client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// A client for downloads, where an overall request timeout would
+/// misfire on a large but healthy transfer. Only the connect phase is
+/// bounded; a stalled connect still fails fast instead of hanging.
+fn download_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
 /// Runs `job` on a background thread, then delivers its result to `on_done`
 /// on the GTK main loop via `glib::spawn_future_local`.
 pub fn spawn_blocking<T, F, U>(job: F, on_done: U)
@@ -53,7 +79,9 @@ where
 
 /// GET `url` and deserialize the JSON response as `T`.
 pub fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, HttpError> {
-    reqwest::blocking::get(url)
+    client()
+        .get(url)
+        .send()
         .map_err(|e| HttpError(e.to_string()))?
         .json::<T>()
         .map_err(|e| HttpError(e.to_string()))
@@ -62,7 +90,7 @@ pub fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, HttpError> {
 /// POST `form` as `application/x-www-form-urlencoded` and deserialize the
 /// JSON response as `T`. Used for the device-code and token endpoints.
 pub fn post_form<T: DeserializeOwned>(url: &str, form: &[(&str, &str)]) -> Result<T, HttpError> {
-    reqwest::blocking::Client::new()
+    client()
         .post(url)
         .form(form)
         .send()
@@ -83,7 +111,7 @@ pub struct RawResponse {
 /// POST `form` and return the raw status/body without treating a non-2xx
 /// status as an error.
 pub fn post_form_raw(url: &str, form: &[(&str, &str)]) -> Result<RawResponse, HttpError> {
-    let response = reqwest::blocking::Client::new()
+    let response = client()
         .post(url)
         .form(form)
         .send()
@@ -96,7 +124,7 @@ pub fn post_form_raw(url: &str, form: &[(&str, &str)]) -> Result<RawResponse, Ht
 /// POST a JSON body and return the raw status/body without treating a
 /// non-2xx status as an error.
 pub fn post_json_raw<B: Serialize>(url: &str, body: &B) -> Result<RawResponse, HttpError> {
-    let response = reqwest::blocking::Client::new()
+    let response = client()
         .post(url)
         .header("Accept", "application/json")
         .json(body)
@@ -110,7 +138,7 @@ pub fn post_json_raw<B: Serialize>(url: &str, body: &B) -> Result<RawResponse, H
 /// POST a JSON body and deserialize the response as `T`. Any non-2xx
 /// status is treated as an error.
 pub fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, HttpError> {
-    reqwest::blocking::Client::new()
+    client()
         .post(url)
         .header("Accept", "application/json")
         .json(body)
@@ -124,7 +152,7 @@ pub fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Resu
 
 /// GET `url` with a bearer token and deserialize the response as `T`.
 pub fn get_json_bearer<T: DeserializeOwned>(url: &str, bearer: &str) -> Result<T, HttpError> {
-    reqwest::blocking::Client::new()
+    client()
         .get(url)
         .bearer_auth(bearer)
         .send()
@@ -145,7 +173,10 @@ pub fn download_to_file(
 ) -> Result<(), HttpError> {
     use std::io::Write;
 
-    let mut response = reqwest::blocking::get(url).map_err(|e| HttpError(e.to_string()))?;
+    let mut response = download_client()
+        .get(url)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?;
     let total = response.content_length().unwrap_or(0);
 
     if let Some(parent) = dest.parent() {

@@ -8,7 +8,7 @@ authors = ["Ken VanDine"]
 repository = "https://github.com/kenvandine/gamepad-minecraft"
 
 [dependencies]
-gtk = { version = "0.11", package = "gtk4" }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_8"] }
 glib = "0.22"
 gilrs = "0.11"
 serde = { version = "1", features = ["derive"] }

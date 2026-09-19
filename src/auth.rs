@@ -36,7 +36,7 @@ const MOJANG_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/pr
 /// to end users. With that setting on, the device-code and token
 /// endpoints accept requests with just a client_id. Adding a secret here
 /// would not be a secret at all once compiled into a distributed binary.
-const DEFAULT_CLIENT_ID: &str = "TODO-azure-app-client-id";
+const DEFAULT_CLIENT_ID: &str = "89725525-f77c-49e5-9960-77ace559b9a6";
 
 fn client_id() -> String {
     std::env::var("GAMEPAD_MINECRAFT_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string())
@@ -371,7 +371,18 @@ pub fn exchange_mojang(xsts_token: &str, user_hash: &str) -> Result<MojangSessio
     let body = Request {
         identity_token: format!("XBL3.0 x={user_hash};{xsts_token}"),
     };
-    let login: LoginResponse = crate::net::post_json(MOJANG_LOGIN_URL, &body)?;
+    let raw = crate::net::post_json_raw(MOJANG_LOGIN_URL, &body)?;
+    if raw.status != 200 {
+        // Surface Mojang's actual response body rather than a bare
+        // "403 Forbidden" - it's the only way to tell a real auth
+        // problem apart from e.g. edge/IP-based blocking on their side.
+        return Err(HttpError(format!(
+            "Mojang sign-in failed (HTTP {}): {}",
+            raw.status, raw.body
+        )));
+    }
+    let login: LoginResponse =
+        serde_json::from_str(&raw.body).map_err(|e| HttpError(e.to_string()))?;
     let profile: McProfile = crate::net::get_json_bearer(MOJANG_PROFILE_URL, &login.access_token)?;
     Ok(MojangSession {
         access_token: login.access_token,
