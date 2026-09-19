@@ -202,13 +202,45 @@ pub fn get_json_bearer<T: DeserializeOwned>(url: &str, bearer: &str) -> Result<T
         .map_err(|e| HttpError(e.to_string()))
 }
 
+/// How many times a single download is retried before giving up. A
+/// real install makes thousands of sequential requests (one per asset
+/// object, plus libraries and the client jar); a connection dropped
+/// mid-transfer by a flaky link or a server closing an idle-too-long
+/// keep-alive is common at that volume, and surfaces as reqwest's
+/// generic "error decoding response body" - not a parsing bug, just an
+/// interrupted stream. Without a retry, one such drop anywhere in that
+/// sequence aborted the *entire* install, even after successfully
+/// downloading almost everything else.
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 4;
+
 /// Downloads `url` to `dest`, calling `on_progress(bytes_done, bytes_total)`
 /// periodically (not per-chunk) so a large asset set doesn't flood the
-/// caller with updates.
+/// caller with updates. Retries the whole transfer (not a resume - these
+/// files are small enough that restarting is simpler and still fast)
+/// up to `DOWNLOAD_MAX_ATTEMPTS` times on failure, with a short backoff.
 pub fn download_to_file(
     url: &str,
     dest: &Path,
     mut on_progress: impl FnMut(u64, u64),
+) -> Result<(), HttpError> {
+    let mut last_err = None;
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        match download_to_file_once(url, dest, &mut on_progress) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < DOWNLOAD_MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(300 * attempt as u64));
+                last_err = Some(e);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop always sets last_err before exiting"))
+}
+
+fn download_to_file_once(
+    url: &str,
+    dest: &Path,
+    on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<(), HttpError> {
     use std::io::Write;
 
