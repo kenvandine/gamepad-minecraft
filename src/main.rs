@@ -1240,6 +1240,13 @@ fn build_ui(app: &Application) {
                 events
             };
             for gilrs::Event { event, .. } in events {
+                // TEMPORARY: tracing every raw gilrs event to diagnose
+                // version-picker D-Pad navigation skipping rows
+                // inconsistently on real hardware - remove once
+                // understood. Printed unconditionally to stderr so it
+                // shows up when run from a terminal without needing a
+                // rebuild with a debug flag.
+                eprintln!("[gilrs] {:?}", event);
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
                         gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
