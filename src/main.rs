@@ -875,6 +875,17 @@ fn build_ui(app: &Application) {
         button.action-button:disabled {
             background-color: #251520; color: alpha(#FFFFFF, 0.45);
         }
+
+        progressbar > trough {
+            background-color: #251520;
+            border-radius: 8px;
+            min-height: 14px;
+        }
+        progressbar > trough > progress {
+            background-color: @orange;
+            background-image: none;
+            border-radius: 8px;
+        }
         "#,
     );
     gtk::style_context_add_provider_for_display(
