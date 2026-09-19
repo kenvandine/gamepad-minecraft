@@ -77,6 +77,22 @@ fn pick_loader_version(mc_version: &str) -> Result<String, HttpError> {
         .ok_or_else(|| HttpError(format!("no Fabric Loader build found for Minecraft {mc_version}")))
 }
 
+/// Fetches the Maven `.sha1` checksum sidecar Maven repositories
+/// conventionally publish alongside every artifact (verified live
+/// against maven.fabricmc.net while diagnosing this). Some repos omit
+/// it for some artifacts, and the sidecar's own body format varies
+/// (bare hex, or `sha1sum`-style "hash  filename") - any failure or
+/// unparseable body just means "no hash available", falling back to
+/// `download_and_verify`'s own truncation check rather than aborting
+/// the install over missing-but-optional metadata.
+fn fetch_maven_sha1(jar_url: &str) -> String {
+    crate::net::get_text(&format!("{jar_url}.sha1"))
+        .ok()
+        .and_then(|body| body.split_whitespace().next().map(str::to_string))
+        .filter(|hash| hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or_default()
+}
+
 /// Installs Fabric Loader for `instance` and layers it onto the
 /// already-written vanilla `LaunchProfile` (main class override, extra
 /// libraries appended to the classpath). Must run after
@@ -99,9 +115,12 @@ pub fn install_fabric_loader(instance: &InstanceMeta) -> Result<(), HttpError> {
         };
         let url = format!("{}/{rel_path}", lib.url.trim_end_matches('/'));
         let dest = libraries_dir.join(&rel_path);
-        if !dest.exists() {
-            crate::net::download_to_file(&url, &dest, |_, _| {})?;
-        }
+        // Real integrity check, not just "does a file already exist at
+        // this path" - a corrupted/truncated jar left over from an
+        // earlier failed attempt was previously treated as "already
+        // downloaded" forever, since nothing ever re-verified it.
+        let expected_sha1 = fetch_maven_sha1(&url);
+        crate::net::download_and_verify(&url, &dest, 0, &expected_sha1)?;
         extra_classpath.push(format!("libraries/{rel_path}"));
     }
 
@@ -123,10 +142,18 @@ struct ModrinthFile {
     url: String,
     filename: String,
     primary: bool,
+    hashes: ModrinthHashes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthHashes {
+    sha1: String,
 }
 
 /// Downloads the newest Fabric build of a Modrinth project compatible
-/// with `mc_version` into `mods_dir`.
+/// with `mc_version` into `mods_dir`, verified against the SHA-1
+/// Modrinth's own API already provides per file (no separate sidecar
+/// fetch needed here, unlike the Maven case).
 fn download_modrinth_mod(slug: &str, mc_version: &str, mods_dir: &Path) -> Result<(), HttpError> {
     let url = format!(
         "{MODRINTH_API}/project/{slug}/version?loaders=[\"fabric\"]&game_versions=[\"{mc_version}\"]"
@@ -143,7 +170,7 @@ fn download_modrinth_mod(slug: &str, mc_version: &str, mods_dir: &Path) -> Resul
         .ok_or_else(|| HttpError(format!("{slug} version has no downloadable files")))?;
 
     fs::create_dir_all(mods_dir).map_err(|e| HttpError(e.to_string()))?;
-    crate::net::download_to_file(&file.url, &mods_dir.join(&file.filename), |_, _| {})
+    crate::net::download_and_verify(&file.url, &mods_dir.join(&file.filename), 0, &file.hashes.sha1)
 }
 
 /// Drops Controlify (and its required YetAnotherConfigLib dependency)

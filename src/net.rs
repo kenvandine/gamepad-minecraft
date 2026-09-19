@@ -202,6 +202,20 @@ pub fn get_json_bearer<T: DeserializeOwned>(url: &str, bearer: &str) -> Result<T
         .map_err(|e| HttpError(e.to_string()))
 }
 
+/// GET `url` and return the response body as plain text. A non-2xx
+/// status is *not* treated as an error - callers that use this for
+/// optional metadata (e.g. a Maven `.sha1` checksum sidecar that may
+/// not exist for a given artifact) can just treat an empty/failed
+/// result as "no data available" rather than aborting.
+pub fn get_text(url: &str) -> Result<String, HttpError> {
+    client()
+        .get(url)
+        .send()
+        .map_err(|e| HttpError(e.to_string()))?
+        .text()
+        .map_err(|e| HttpError(e.to_string()))
+}
+
 /// How many times a single download is retried before giving up. A
 /// real install makes thousands of sequential requests (one per asset
 /// object, plus libraries and the client jar); a connection dropped
@@ -286,4 +300,102 @@ fn download_to_file_once(
         )));
     }
     Ok(())
+}
+
+const INTEGRITY_MAX_ATTEMPTS: u32 = 3;
+
+/// Downloads `url` to `dest` unless it's already there with a matching
+/// size *and* SHA-1 hash - a real integrity check, not just a size
+/// comparison. Pass `""` for `expected_sha1` when no hash is available
+/// (falls back to a size-only check, or none at all if `expected_size`
+/// is also `0`) and/or `0` for `expected_size` when the size isn't
+/// known ahead of time (Fabric's own library metadata doesn't include
+/// one). Retries a few times on a hash mismatch, since
+/// `download_to_file`'s own retries only cover network/transfer
+/// errors, not "downloaded successfully but wrong" - which matters
+/// because a same-length-but-wrong-content file produces bizarre,
+/// unrelated-looking failures much later (a corrupted jar on the
+/// classpath crashing deep inside the JVM's own bootstrap) instead of
+/// a clear "bad download" message right here.
+pub fn download_and_verify(
+    url: &str,
+    dest: &Path,
+    expected_size: u64,
+    expected_sha1: &str,
+) -> Result<(), HttpError> {
+    if file_matches(dest, expected_size, expected_sha1) {
+        return Ok(());
+    }
+    let mut last_err = None;
+    for attempt in 1..=INTEGRITY_MAX_ATTEMPTS {
+        download_to_file(url, dest, |_, _| {})?;
+        if file_matches(dest, expected_size, expected_sha1) {
+            return Ok(());
+        }
+        last_err = Some(HttpError(format!(
+            "{} failed its integrity check after downloading (attempt {attempt}/{INTEGRITY_MAX_ATTEMPTS})",
+            dest.display()
+        )));
+    }
+    Err(last_err.expect("loop always sets last_err before exiting"))
+}
+
+fn file_matches(dest: &Path, expected_size: u64, expected_sha1: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(dest) else {
+        return false;
+    };
+    if expected_size != 0 && meta.len() != expected_size {
+        return false;
+    }
+    if expected_sha1.is_empty() {
+        return true;
+    }
+    sha1_hex(dest)
+        .map(|h| h.eq_ignore_ascii_case(expected_sha1))
+        .unwrap_or(false)
+}
+
+fn sha1_hex(path: &Path) -> Result<String, HttpError> {
+    use sha1::{Digest, Sha1};
+    let bytes = std::fs::read(path).map_err(|e| HttpError(e.to_string()))?;
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_hex_matches_known_value() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-net-test-sha1-known.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        assert_eq!(sha1_hex(&path).unwrap(), "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_rejects_wrong_size() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-net-test-size.txt");
+        std::fs::write(&path, b"short").unwrap();
+        assert!(!file_matches(&path, 999, ""));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_rejects_wrong_hash() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-net-test-hash.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        assert!(!file_matches(&path, 0, "0000000000000000000000000000000000000000"));
+        assert!(file_matches(&path, 0, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_matches_missing_file_is_false() {
+        let path = std::env::temp_dir().join("gamepad-minecraft-net-test-does-not-exist.txt");
+        let _ = std::fs::remove_file(&path);
+        assert!(!file_matches(&path, 0, ""));
+    }
 }
