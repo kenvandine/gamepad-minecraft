@@ -1,0 +1,38 @@
+[package]
+name = "gamepad-minecraft"
+version = "0.1.0"
+edition = "2021"
+description = "A controller-first Minecraft Java launcher for Ubuntu handhelds"
+license = "GPL-3.0-or-later"
+authors = ["Ken VanDine"]
+repository = "https://github.com/kenvandine/gamepad-minecraft"
+
+[dependencies]
+gtk = { version = "0.11", package = "gtk4" }
+glib = "0.22"
+gilrs = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Networking (device-code auth + downloads). "blocking" keeps every call
+# site synchronous; see src/net.rs for how results cross to the GTK main
+# loop without pulling an async runtime into the rest of the app.
+reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
+async-channel = "2.5"
+
+# QR rendering for the device-code sign-in screen. Only the module-matrix
+# encoder is needed (we rasterize to RGBA ourselves in src/qr.rs), so the
+# image/svg/pic default features are dropped.
+qrcode = { version = "0.14", default-features = false }
+
+# Extracting LWJGL "natives" jars for the bundled Minecraft instances.
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+# Verifying downloaded assets against Mojang's version manifest sha1s.
+sha2 = "0.11"
+
+# Offline-mode UUID derivation (must bit-match Java's
+# UUID.nameUUIDFromBytes for a player name).
+md-5 = "0.11"
+uuid = { version = "1.26", features = ["serde"] }

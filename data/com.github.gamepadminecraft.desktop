@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Minecraft
+GenericName=Minecraft Launcher
+Comment=A gamepad-friendly Minecraft Java launcher
+Exec=gamepad-minecraft
+Icon=com.github.gamepadminecraft
+Terminal=false
+Categories=Game;
+Keywords=minecraft;java;game;gamepad;controller;
+X-Purism-FormFactor=Workstation;Mobile;

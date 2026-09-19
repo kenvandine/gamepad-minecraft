@@ -1,0 +1,71 @@
+name: gamepad-minecraft
+base: core24
+version: '0.1.0'
+summary: A controller-first Minecraft Java launcher for handhelds
+description: |
+  gamepad-minecraft is a Rust/GTK4 launcher for Minecraft Java Edition,
+  purpose-built for Ubuntu handheld gaming devices (Lenovo Legion Go S,
+  MSI Claw). Sign in once with a Microsoft account via a QR-code
+  device-code flow, then play fully offline afterward using a cached
+  profile - no keyboard or mouse required at any point. New instances get
+  Fabric Loader and the Controlify mod injected automatically so
+  Minecraft's own title screen is gamepad-navigable too.
+
+  Minecraft Java Edition itself is not distributed in this snap - the
+  first launch requires network access to download it directly from
+  Mojang, the same as the official launcher.
+
+grade: stable
+confinement: strict
+
+icon: data/icons/com.github.gamepadminecraft.svg
+
+apps:
+  gamepad-minecraft:
+    command: bin/gamepad-minecraft
+    desktop: share/applications/com.github.gamepadminecraft.desktop
+    extensions: [gnome]
+    plugs:
+      - network            # device-code login, Xbox/Mojang exchange, downloads
+      - network-bind       # reserved for a possible future LAN-play feature
+      - joystick           # /dev/input/js*, /dev/input/event* (ID_INPUT_JOYSTICK)
+      - opengl             # launcher UI and Minecraft's own rendering
+      - audio-playback
+      - wayland
+      - x11
+      - desktop
+      - desktop-legacy
+      - process-control    # spawn/monitor the bundled java child process
+      - removable-media    # reserved for storing instances on a MicroSD card
+
+parts:
+  gamepad-minecraft:
+    plugin: rust
+    source: .
+    # Same fix as gamepad-2048: the gnome extension prepends its SDK's own
+    # libc to LD_LIBRARY_PATH for the build step, but that libc is
+    # incompatible with the rustup/cargo/rustc binaries (snap), causing
+    # "symbol lookup error: ...libc.so.6: undefined symbol:
+    # __nptl_change_stack_perm". Rust's toolchain doesn't need the GNOME
+    # SDK's libraries at invocation time (only pkg-config/headers do, via
+    # PKG_CONFIG_PATH), so clear it here.
+    build-environment:
+      - LD_LIBRARY_PATH: ""
+
+  jre:
+    plugin: nil
+    stage-packages:
+      - openjdk-21-jre-headless
+    # Strict confinement forbids exec'ing arbitrary host binaries, so the
+    # JRE is staged inside the snap; launch.rs invokes
+    # $SNAP/usr/lib/jvm/java-21-openjdk-amd64/bin/java directly.
+    prime:
+      - usr/lib/jvm/java-21-openjdk-amd64
+
+  data:
+    plugin: dump
+    source: data
+    organize:
+      com.github.gamepadminecraft.desktop: share/applications/com.github.gamepadminecraft.desktop
+      icons/com.github.gamepadminecraft.png: share/icons/hicolor/256x256/apps/com.github.gamepadminecraft.png
+      icons/com.github.gamepadminecraft.svg: share/icons/hicolor/scalable/apps/com.github.gamepadminecraft.svg
