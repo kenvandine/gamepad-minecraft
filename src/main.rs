@@ -803,6 +803,7 @@ fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
 /// wrap at the ends, same as gamepad-2048's own documented behavior.
 fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
     let Some(focused) = gtk::prelude::RootExt::focus(window) else {
+        eprintln!("[focus] step forward={forward}: nothing focused");
         return false;
     };
     let next = if forward {
@@ -810,10 +811,27 @@ fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
     } else {
         focused.prev_sibling()
     };
-    match next {
+    let moved = match &next {
         Some(widget) => widget.grab_focus(),
         None => false,
-    }
+    };
+    // TEMPORARY: diagnosing D-Pad navigation skipping rows even with a
+    // single, clean ButtonPressed event (confirmed via the [gilrs]
+    // trace) - logging by label text so we can compare what the code
+    // actually did against what's visually highlighted on screen.
+    eprintln!(
+        "[focus] step forward={forward} before={:?} after={:?} moved={moved}",
+        widget_label(&focused),
+        next.as_ref().and_then(widget_label),
+    );
+    moved
+}
+
+fn widget_label(widget: &gtk::Widget) -> Option<String> {
+    widget
+        .downcast_ref::<gtk::Button>()
+        .and_then(|b| b.label())
+        .map(|s| s.to_string())
 }
 
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
