@@ -1228,25 +1228,41 @@ fn build_ui(app: &Application) {
     }
     refresh_instance_grid(&state, &widgets);
 
-    // Shared with the gamepad D-Pad handler below - see
-    // `nav_step_if_not_debounced` for why this must be one gate, not
-    // one per input path.
-    let dpad_nav_gate = Rc::new(RefCell::new(std::time::Instant::now() - DPAD_NAV_DEBOUNCE));
+    // Shared with the keyboard handler below, so it can tell whether a
+    // real gamepad is currently connected.
+    let gilrs_shared: Option<Rc<RefCell<gilrs::Gilrs>>> =
+        gilrs::Gilrs::new().ok().map(|g| Rc::new(RefCell::new(g)));
 
     // ── Keyboard fallback ──
     // Arrow keys drive the same directional focus search as the D-Pad
     // (GTK doesn't wire arrow keys to focus movement on its own, unlike
     // Tab); Enter/Space already activate the focused widget via GTK's
     // own default key handling, so only Escape needs an explicit hook.
+    //
+    // Up/Down are disabled outright whenever a real gamepad is
+    // connected - not just debounced. On at least one real device
+    // (Steam Input, per its hostname in that device's own AppArmor
+    // logs) the same D-Pad press is *also* synthesized as a keyboard
+    // arrow key, and the desktop's own key-repeat treats that
+    // synthesized key as genuinely held: it kept firing independent
+    // "repeat" events for as long as the physical button was down,
+    // each one spaced hundreds of milliseconds to over a second apart.
+    // No debounce window can catch repeats spaced that far apart
+    // without also breaking legitimate rapid keyboard navigation, so
+    // the only reliable fix is to not listen to the keyboard path at
+    // all while a gamepad exists to generate the same input for real.
     let key_controller = gtk::EventControllerKey::new();
     let state_kb = state.clone();
     let widgets_kb = widgets.clone();
-    let dpad_nav_gate_kb = dpad_nav_gate.clone();
+    let gilrs_for_kb = gilrs_shared.clone();
     key_controller.connect_key_pressed(move |_, key, _, _| {
         use gtk::gdk::Key;
+        let gamepad_connected = gilrs_for_kb
+            .as_ref()
+            .is_some_and(|g| g.borrow().gamepads().any(|(_, gp)| gp.is_connected()));
         match key {
-            Key::Up => nav_step_if_not_debounced(&dpad_nav_gate_kb, &widgets_kb.window, false),
-            Key::Down => nav_step_if_not_debounced(&dpad_nav_gate_kb, &widgets_kb.window, true),
+            Key::Up if !gamepad_connected => step_focus(&widgets_kb.window, false),
+            Key::Down if !gamepad_connected => step_focus(&widgets_kb.window, true),
             Key::Left => widgets_kb.window.child_focus(gtk::DirectionType::Left),
             Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
             Key::Escape => {
@@ -1273,11 +1289,10 @@ fn build_ui(app: &Application) {
     // Button identity for face buttons is resolved exclusively through
     // input::classify_button (see input.rs for why); D-Pad directions
     // are handled here directly, same split gamepad-2048 uses.
-    if let Ok(gilrs) = gilrs::Gilrs::new() {
-        let gilrs = Rc::new(RefCell::new(gilrs));
+    if let Some(gilrs) = gilrs_shared {
         let state_for_gp = state.clone();
         let widgets_for_gp = widgets.clone();
-        let dpad_nav_gate_gp = dpad_nav_gate.clone();
+        let dpad_nav_gate_gp = Rc::new(RefCell::new(std::time::Instant::now() - DPAD_NAV_DEBOUNCE));
         let trace_epoch = std::time::Instant::now();
         glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let events: Vec<gilrs::Event> = {
