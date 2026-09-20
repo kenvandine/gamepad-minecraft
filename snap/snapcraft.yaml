@@ -63,11 +63,57 @@ parts:
       # recognize at all and refuses to start with. Track the current
       # OpenJDK LTS rather than pinning to 21.
       - openjdk-25-jre-headless
+    # Only needed at build time, to regenerate cacerts below - not
+    # staged into the snap itself.
+    build-packages:
+      - ca-certificates
     # Strict confinement forbids exec'ing arbitrary host binaries, so the
     # JRE is staged inside the snap; launch.rs invokes
     # $SNAP/usr/lib/jvm/java-25-openjdk-amd64/bin/java directly.
+    #
+    # Two real-hardware-confirmed gaps in a bare `prime` of just the JVM
+    # tree, both traced via AVC "DENIED" entries plus manually walking
+    # every symlink under java-25-openjdk-amd64/conf and lib/security:
+    #
+    # 1. $JAVA_HOME/conf/security/java.security - the file
+    #    sun.security.jca.Providers reads to build its provider list -
+    #    is a *symlink* to /etc/java-25-openjdk/security/java.security,
+    #    which openjdk-25-jre-headless does own, but which the original
+    #    `prime` list (just the JVM tree) excluded from the snap
+    #    entirely. Once that class's static initializer fails, the JVM
+    #    permanently marks it erroneous, so every later reference just
+    #    throws a bare, uninformative NoClassDefFoundError - which is
+    #    what surfaced (misleadingly) inside Fabric Loader's KnotClient.
+    #    Fixed by also priming etc/java-25-openjdk.
+    # 2. $JAVA_HOME/lib/security/cacerts is *also* a symlink, to
+    #    /etc/ssl/certs/java/cacerts - but that file isn't owned by any
+    #    package's static file list at all (`dpkg -S` finds nothing for
+    #    it). It only ever exists because ca-certificates-java's
+    #    postinst trigger script generates it at install time, and
+    #    snapcraft's stage-packages never runs postinst/trigger
+    #    scripts (it only unpacks .deb contents). Fixed below by
+    #    rebuilding the keystore directly from the system's PEM CA
+    #    bundle with keytool - verified end-to-end with a real HTTPS
+    #    request before landing this.
+    override-build: |
+      craftctl default
+      JAVA_HOME="$CRAFT_PART_INSTALL/usr/lib/jvm/java-25-openjdk-amd64"
+      rm -f "$JAVA_HOME/lib/security/cacerts"
+      split_dir="$CRAFT_PART_BUILD/ca-certs-split"
+      rm -rf "$split_dir"
+      mkdir -p "$split_dir"
+      csplit -s -z -f "$split_dir/cert-" -b "%03d.pem" \
+        /etc/ssl/certs/ca-certificates.crt '/-----BEGIN CERTIFICATE-----/' '{*}'
+      for cert in "$split_dir"/cert-*.pem; do
+        "$JAVA_HOME/bin/keytool" -importcert -noprompt \
+          -keystore "$JAVA_HOME/lib/security/cacerts" \
+          -storepass changeit \
+          -alias "$(basename "$cert" .pem)" \
+          -file "$cert"
+      done
     prime:
       - usr/lib/jvm/java-25-openjdk-amd64
+      - etc/java-25-openjdk
 
   data:
     plugin: dump
