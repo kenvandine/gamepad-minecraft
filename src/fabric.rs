@@ -173,13 +173,19 @@ fn download_modrinth_mod(slug: &str, mc_version: &str, mods_dir: &Path) -> Resul
     crate::net::download_and_verify(&file.url, &mods_dir.join(&file.filename), 0, &file.hashes.sha1)
 }
 
-/// Drops Controlify (and its required YetAnotherConfigLib dependency)
-/// into `instance`'s `mods/` directory, fetched from Modrinth by
-/// project slug. Requires Fabric to already be installed on `instance`.
+/// Drops Controlify and its required dependencies (Fabric API,
+/// YetAnotherConfigLib) into `instance`'s `mods/` directory, fetched
+/// from Modrinth by project slug. Requires Fabric to already be
+/// installed on `instance`.
 pub fn inject_controlify_mod(instance: &InstanceMeta) -> Result<(), HttpError> {
     let mods_dir = InstanceStore::instance_dir(&instance.id).join("mods");
-    // Controlify hard-depends on YACL for its config screens; without it
-    // Fabric refuses to start with a missing-dependency error.
+    // Order matters for the dependency chain: YACL requires fabric-api,
+    // and Controlify requires YACL - confirmed live via Fabric's own
+    // "Incompatible mods found!" error, which named the missing
+    // fabric-api version needed by YACL. Without fabric-api, Fabric
+    // refuses to start with a missing-dependency error before the game
+    // even gets to load Controlify's or YACL's own code.
+    download_modrinth_mod("fabric-api", &instance.mc_version, &mods_dir)?;
     download_modrinth_mod("yacl", &instance.mc_version, &mods_dir)?;
     download_modrinth_mod("controlify", &instance.mc_version, &mods_dir)?;
     Ok(())
