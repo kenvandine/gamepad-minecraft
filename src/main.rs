@@ -834,6 +834,39 @@ fn widget_label(widget: &gtk::Widget) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+// A physical D-Pad press can arrive as more than one discrete
+// navigation signal for the exact same press: some controllers/drivers
+// send a brief repeat burst of `ButtonPressed` events rather than one
+// clean edge, and on at least one real device (Steam Input, confirmed
+// via its hostname in that device's own AppArmor logs) the same D-Pad
+// press is *also* synthesized as a keyboard arrow-key event for
+// compatibility with apps that don't read gamepads directly - meaning
+// our gilrs handler and our keyboard fallback handler can each fire
+// once for what is, physically, a single press. Every one of those
+// signals is individually a perfectly valid single-step move, so
+// without a shared cooldown across *both* input paths, one physical
+// press could step several rows at once - which is exactly what
+// "skips rows" looked like, even though each individual `step_focus`
+// call only ever moves one row on its own.
+const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Steps focus unless another accepted step (from *either* input path)
+/// happened within `DPAD_NAV_DEBOUNCE`. `gate` must be shared between
+/// the gamepad and keyboard handlers - a debounce scoped to only one of
+/// them can't catch a duplicate arriving through the other.
+fn nav_step_if_not_debounced(
+    gate: &Rc<RefCell<std::time::Instant>>,
+    window: &ApplicationWindow,
+    forward: bool,
+) -> bool {
+    let mut last = gate.borrow_mut();
+    if last.elapsed() < DPAD_NAV_DEBOUNCE {
+        return false;
+    }
+    *last = std::time::Instant::now();
+    step_focus(window, forward)
+}
+
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
 // Confirm always activates whatever GTK reports as focused - never a
 // per-screen hardcoded action derived from AppData - so the highlighted
@@ -1195,6 +1228,11 @@ fn build_ui(app: &Application) {
     }
     refresh_instance_grid(&state, &widgets);
 
+    // Shared with the gamepad D-Pad handler below - see
+    // `nav_step_if_not_debounced` for why this must be one gate, not
+    // one per input path.
+    let dpad_nav_gate = Rc::new(RefCell::new(std::time::Instant::now() - DPAD_NAV_DEBOUNCE));
+
     // ── Keyboard fallback ──
     // Arrow keys drive the same directional focus search as the D-Pad
     // (GTK doesn't wire arrow keys to focus movement on its own, unlike
@@ -1203,11 +1241,12 @@ fn build_ui(app: &Application) {
     let key_controller = gtk::EventControllerKey::new();
     let state_kb = state.clone();
     let widgets_kb = widgets.clone();
+    let dpad_nav_gate_kb = dpad_nav_gate.clone();
     key_controller.connect_key_pressed(move |_, key, _, _| {
         use gtk::gdk::Key;
         match key {
-            Key::Up => step_focus(&widgets_kb.window, false),
-            Key::Down => step_focus(&widgets_kb.window, true),
+            Key::Up => nav_step_if_not_debounced(&dpad_nav_gate_kb, &widgets_kb.window, false),
+            Key::Down => nav_step_if_not_debounced(&dpad_nav_gate_kb, &widgets_kb.window, true),
             Key::Left => widgets_kb.window.child_focus(gtk::DirectionType::Left),
             Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
             Key::Escape => {
@@ -1238,16 +1277,7 @@ fn build_ui(app: &Application) {
         let gilrs = Rc::new(RefCell::new(gilrs));
         let state_for_gp = state.clone();
         let widgets_for_gp = widgets.clone();
-        // A physical D-Pad press can arrive as more than one discrete
-        // `ButtonPressed` event - mechanical switch bounce, or a
-        // controller/driver that reports a brief repeat stream rather
-        // than a single clean edge. Every one of those is a perfectly
-        // valid single-step move on its own, so without a cooldown a
-        // single tap could step several rows at once, which is exactly
-        // what "skips big chunks" looks like even though each
-        // individual `step_focus` call only ever moves one row.
-        const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
-        let mut last_dpad_nav = std::time::Instant::now() - DPAD_NAV_DEBOUNCE;
+        let dpad_nav_gate_gp = dpad_nav_gate.clone();
         let trace_epoch = std::time::Instant::now();
         glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let events: Vec<gilrs::Event> = {
@@ -1269,11 +1299,11 @@ fn build_ui(app: &Application) {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
                         gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
-                            if last_dpad_nav.elapsed() < DPAD_NAV_DEBOUNCE {
-                                continue;
-                            }
-                            last_dpad_nav = std::time::Instant::now();
-                            step_focus(&widgets_for_gp.window, button == gilrs::Button::DPadDown);
+                            nav_step_if_not_debounced(
+                                &dpad_nav_gate_gp,
+                                &widgets_for_gp.window,
+                                button == gilrs::Button::DPadDown,
+                            );
                         }
                         gilrs::Button::DPadLeft => {
                             widgets_for_gp.window.child_focus(gtk::DirectionType::Left);
