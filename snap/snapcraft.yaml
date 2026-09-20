@@ -1,24 +1,29 @@
 name: gamepad-minecraft
 base: core24
 version: '0.1.0'
-summary: A controller-first Minecraft Java launcher for handhelds
+summary: A controller-friendly Minecraft Java launcher for handhelds
 description: |
-  gamepad-minecraft is a Rust/GTK4 launcher for Minecraft Java Edition,
-  purpose-built for Ubuntu handheld gaming devices (Lenovo Legion Go S,
-  MSI Claw). Sign in once with a Microsoft account via a QR-code
-  device-code flow, then play fully offline afterward using a cached
-  profile - no keyboard or mouse required at any point. New instances get
-  Fabric Loader and the Controlify mod injected automatically so
-  Minecraft's own title screen is gamepad-navigable too.
+  Play Minecraft Java Edition entirely with a gamepad - no keyboard or
+  mouse required. Built for handheld gaming PCs like the Lenovo Legion Go
+  S and MSI Claw, gamepad-minecraft lets you sign in once with your
+  Microsoft account using a simple on-screen QR code, then play offline
+  afterward with your saved profile. It also sets up your game so that
+  Minecraft's own menus and title screen are fully navigable with a
+  controller, not just the launcher itself.
 
-  Minecraft Java Edition itself is not distributed in this snap - the
-  first launch requires network access to download it directly from
-  Mojang, the same as the official launcher.
+  Minecraft Java Edition itself is not included with this app - the first
+  launch downloads it directly from Mojang, the same as the official
+  launcher.
 
 grade: stable
 confinement: strict
 
 icon: data/icons/com.github.gamepadminecraft.svg
+
+contact: https://github.com/kenvandine/gamepad-minecraft/issues
+issues: https://github.com/kenvandine/gamepad-minecraft/issues
+source-code: https://github.com/kenvandine/gamepad-minecraft
+website: https://github.com/kenvandine/gamepad-minecraft
 
 apps:
   gamepad-minecraft:
