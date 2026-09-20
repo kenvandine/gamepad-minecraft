@@ -1228,8 +1228,9 @@ fn build_ui(app: &Application) {
         // single tap could step several rows at once, which is exactly
         // what "skips big chunks" looks like even though each
         // individual `step_focus` call only ever moves one row.
-        const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(160);
+        const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
         let mut last_dpad_nav = std::time::Instant::now() - DPAD_NAV_DEBOUNCE;
+        let trace_epoch = std::time::Instant::now();
         glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let events: Vec<gilrs::Event> = {
                 let mut gp = gilrs.borrow_mut();
@@ -1246,7 +1247,7 @@ fn build_ui(app: &Application) {
                 // understood. Printed unconditionally to stderr so it
                 // shows up when run from a terminal without needing a
                 // rebuild with a debug flag.
-                eprintln!("[gilrs] {:?}", event);
+                eprintln!("[gilrs] t={:>6}ms {:?}", trace_epoch.elapsed().as_millis(), event);
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
                         gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
