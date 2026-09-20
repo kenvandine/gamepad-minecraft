@@ -994,58 +994,60 @@ fn build_ui(app: &Application) {
     window.set_title(Some("Minecraft"));
     window.set_default_size(1280, 800);
 
-    // ── Theme: Ubuntu "Resolute Raccoon" palette, inherited from
-    // gamepad-shell / gamepad-2048 (PLAN.md §4).
+    // ── Theme: Minecraft palette (grass green, dirt brown, stone grey)
+    // on a true black dark-mode background, matching the app icon.
     let css_provider = gtk::CssProvider::new();
     css_provider.load_from_data(
         r#"
-        @define-color orange #E95420;
-        @define-color orange_bright #F4703C;
-        @define-color aubergine #2C001E;
-        @define-color purple #77216F;
+        @define-color mc_grass #5D9C34;
+        @define-color mc_grass_bright #7CC53E;
+        @define-color mc_dirt #6B4A2C;
+        @define-color mc_stone #3A3A3A;
+        @define-color mc_stone_light #4A4A4A;
+        @define-color mc_stone_dark #1C1C1C;
 
         * { font-family: "Ubuntu Sans", "Ubuntu", sans-serif; }
-        window { background-color: #150610; color: #FFFFFF; }
+        window { background-color: #0D0D0D; color: #FFFFFF; }
 
         .page { padding: 40px; }
-        .game-title { font-size: 44px; font-weight: 800; color: @orange; }
+        .game-title { font-size: 44px; font-weight: 800; color: @mc_grass_bright; }
         .control-hint {
             font-size: 13px; font-weight: 500; letter-spacing: 0.5px;
             color: alpha(#FFFFFF, 0.55);
         }
         .user-code {
             font-size: 32px; font-weight: 700; letter-spacing: 4px;
-            color: @orange_bright;
+            color: @mc_grass_bright;
         }
 
         button.action-button {
             padding: 14px 24px; border-radius: 14px;
-            border: 2px solid alpha(#FFFFFF, 0.12);
-            background-color: #3A1A28;
+            border: 2px solid alpha(@mc_dirt, 0.7);
+            background-color: @mc_stone;
             background-image: none;
             box-shadow: none;
             color: #FFFFFF; font-size: 16px; font-weight: 600;
             min-height: 48px; min-width: 260px;
             transition: all 120ms ease-out;
         }
-        button.action-button:hover { background-color: #4A2550; }
+        button.action-button:hover { background-color: @mc_stone_light; }
         button.action-button:focus, button.action-button:active {
-            background-color: @orange;
-            border-color: @orange_bright;
-            box-shadow: 0 0 0 3px alpha(@orange, 0.35);
+            background-color: @mc_grass;
+            border-color: @mc_grass_bright;
+            box-shadow: 0 0 0 3px alpha(@mc_grass, 0.35);
             outline: none;
         }
         button.action-button:disabled {
-            background-color: #251520; color: alpha(#FFFFFF, 0.45);
+            background-color: @mc_stone_dark; color: alpha(#FFFFFF, 0.45);
         }
 
         progressbar > trough {
-            background-color: #251520;
+            background-color: @mc_stone_dark;
             border-radius: 8px;
             min-height: 14px;
         }
         progressbar > trough > progress {
-            background-color: @orange;
+            background-color: @mc_grass;
             background-image: none;
             border-radius: 8px;
         }
@@ -1059,11 +1061,23 @@ fn build_ui(app: &Application) {
 
     let stack = gtk::Stack::new();
 
+    // ── App icon, shared between the Login and Home screens ──
+    let app_icon_bytes = include_bytes!("../data/icons/com.github.gamepadminecraft.png");
+    let app_icon_texture =
+        gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(app_icon_bytes))
+            .expect("bundled app icon PNG failed to decode");
+
     // ── Login page ──
     let login_page = gtk::Box::new(gtk::Orientation::Vertical, 20);
     login_page.set_css_classes(&["page"]);
     login_page.set_halign(gtk::Align::Center);
     login_page.set_valign(gtk::Align::Center);
+
+    let login_icon = gtk::Picture::for_paintable(&app_icon_texture);
+    login_icon.set_size_request(96, 96);
+    login_icon.set_content_fit(gtk::ContentFit::Contain);
+    login_icon.set_can_shrink(true);
+    login_page.append(&login_icon);
 
     let title = gtk::Label::new(Some("Minecraft"));
     title.set_css_classes(&["game-title"]);
@@ -1104,6 +1118,12 @@ fn build_ui(app: &Application) {
     home_page.set_css_classes(&["page"]);
     home_page.set_halign(gtk::Align::Center);
     home_page.set_valign(gtk::Align::Center);
+
+    let home_icon = gtk::Picture::for_paintable(&app_icon_texture);
+    home_icon.set_size_request(96, 96);
+    home_icon.set_content_fit(gtk::ContentFit::Contain);
+    home_icon.set_can_shrink(true);
+    home_page.append(&home_icon);
 
     let home_title = gtk::Label::new(Some("Minecraft"));
     home_title.set_css_classes(&["game-title"]);
