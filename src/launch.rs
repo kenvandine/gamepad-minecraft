@@ -179,6 +179,70 @@ fn force_fullscreen_true(existing_options_txt: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// Recursively forces every JSON object key literally named
+/// `mixed_input` to `true`. Returns whether anything actually changed.
+fn force_mixed_input_true(value: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if key == "mixed_input" {
+                    if *v != serde_json::Value::Bool(true) {
+                        *v = serde_json::Value::Bool(true);
+                        changed = true;
+                    }
+                } else if force_mixed_input_true(v) {
+                    changed = true;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                if force_mixed_input_true(v) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// Forces Controlify's "Mixed Input" setting on, so this controller-only
+/// device never trips Controlify's own conflict-detection safety valve
+/// (`Controlify.java`'s `consecutiveInputSwitches` counter, confirmed
+/// live via a real "Controller disabled" toast): touch input arriving as
+/// real GLFW mouse events, racing real gamepad input, reads to Controlify
+/// as "the controller conflicts with keyboard and mouse" and permanently
+/// disables it for that session. "Mixed Input" is Controlify's own
+/// designed escape hatch for exactly this - letting a controller and
+/// mouse/keyboard coexist without ever forcing an exclusive mode switch.
+///
+/// A no-op until Controlify has run at least once and written its own
+/// config (nothing to patch on a fresh install before the first launch).
+/// Deliberately edits only the one key it already knows the name of
+/// (`mixed_input`) via a generic JSON walk, rather than authoring or
+/// assuming any of Controlify's DataFixerUpper-versioned schema - so it
+/// can't fight a future Controlify update's own config migrations the
+/// way hand-authoring the whole file would.
+fn ensure_controlify_mixed_input(instance: &InstanceMeta) -> Result<(), String> {
+    let path = InstanceStore::instance_dir(&instance.id)
+        .join("config")
+        .join("controlify")
+        .join("controlify.json");
+    let Ok(existing) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&existing) else {
+        return Ok(());
+    };
+    if force_mixed_input_true(&mut value) {
+        let updated = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+        fs::write(&path, updated).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Spawns Minecraft for `instance` as `account` and blocks until it
 /// exits, reporting `LaunchEvent`s via `on_event` (`Started` once the
 /// process is up, then `Exited`/`Crashed` when it's done). Meant to be
@@ -199,6 +263,11 @@ pub fn spawn_minecraft(
     // in options.txt before every launch rather than relying on the
     // player to have set it manually.
     ensure_fullscreen_option(instance)?;
+
+    // Idempotent no-op until Controlify has run once and written its own
+    // config - see that function's doc comment for why this device needs
+    // Mixed Input forced on at all.
+    ensure_controlify_mixed_input(instance)?;
 
     let natives_dir = extract_natives(instance, &profile)?;
     let classpath_paths = build_classpath(instance, &profile);
@@ -265,6 +334,37 @@ mod tests {
     #[test]
     fn force_fullscreen_true_handles_empty_file() {
         assert_eq!(force_fullscreen_true(""), "fullscreen:true\n");
+    }
+
+    #[test]
+    fn force_mixed_input_true_flips_nested_false() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"settings":{"global":{"mixed_input":false,"other":1}}}"#)
+                .unwrap();
+        assert!(force_mixed_input_true(&mut value));
+        assert_eq!(value["settings"]["global"]["mixed_input"], true);
+        assert_eq!(value["settings"]["global"]["other"], 1);
+    }
+
+    #[test]
+    fn force_mixed_input_true_is_noop_when_already_true() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"mixed_input":true}"#).unwrap();
+        assert!(!force_mixed_input_true(&mut value));
+    }
+
+    #[test]
+    fn force_mixed_input_true_is_noop_when_key_absent() {
+        let mut value: serde_json::Value = serde_json::from_str(r#"{"other":"value"}"#).unwrap();
+        assert!(!force_mixed_input_true(&mut value));
+    }
+
+    #[test]
+    fn force_mixed_input_true_finds_key_inside_arrays() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"profiles":[{"mixed_input":false}]}"#).unwrap();
+        assert!(force_mixed_input_true(&mut value));
+        assert_eq!(value["profiles"][0]["mixed_input"], true);
     }
 
     fn test_instance() -> InstanceMeta {
