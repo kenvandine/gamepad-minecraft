@@ -39,6 +39,22 @@ struct AppData {
     /// Set while a device-code poll thread is running, so Back can
     /// cancel it instead of leaving it to poll Microsoft until expiry.
     poll_cancel: Option<Arc<AtomicBool>>,
+    /// True from the moment a launch is kicked off until Minecraft's
+    /// process exits. `gilrs` reads the gamepad's raw evdev device
+    /// directly, completely bypassing the compositor's window-focus
+    /// routing - so unlike keyboard input, our own gilrs poll loop never
+    /// stops seeing button presses just because Minecraft's window is
+    /// now the one actually focused/visible. Without this flag, every
+    /// "A" press during real gameplay (jumping, interacting - a
+    /// constantly-used button) would still land on `handle_gp_confirm`,
+    /// re-activate whichever button was last focused in our own
+    /// (backgrounded) window - almost always the "Play" button the
+    /// player just used - and spawn *another* independent `java`
+    /// process on top of the one already running. Confirmed live: this
+    /// is what was producing the repeated "small window + Mojang
+    /// loading screen" flashes and runaway CPU/memory use during a
+    /// single play session, not an actual Minecraft crash-and-restart.
+    minecraft_running: bool,
 }
 
 // ─── Shared widget handles ─────────────────────────────────────────
@@ -599,6 +615,10 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
 /// that fails, same non-blocking philosophy as PLAN.md §3's silent
 /// refresh.
 fn start_launch_instance(state: &Arc<Mutex<AppData>>, widgets: &Widgets, meta: InstanceMeta) {
+    if state.lock().unwrap().minecraft_running {
+        return;
+    }
+
     let (account, refresh_token) = {
         let data = state.lock().unwrap();
         let account = match &data.auth {
@@ -644,6 +664,8 @@ fn do_launch(
     account: CachedAccount,
     access_token: Option<String>,
 ) {
+    state.lock().unwrap().minecraft_running = true;
+
     let widgets2 = widgets.clone();
     let state2 = state.clone();
     net::spawn_blocking(
@@ -652,6 +674,7 @@ fn do_launch(
                 .map_err(HttpError)
         },
         move |result| {
+            state2.lock().unwrap().minecraft_running = false;
             widgets2.home_status_label.set_label(match &result {
                 Ok(()) => "Minecraft exited.",
                 Err(_) => "Launch failed.",
@@ -1201,6 +1224,7 @@ fn build_ui(app: &Application) {
         instances: InstanceStore::load(),
         auth: auth::AuthState::Resolving,
         poll_cancel: None,
+        minecraft_running: false,
     }));
 
     let widgets = Widgets {
@@ -1356,6 +1380,16 @@ fn build_ui(app: &Application) {
                 }
                 events
             };
+            // Draining next_event() above (rather than bailing out
+            // before it) still matters even while Minecraft owns the
+            // screen: it keeps gilrs's own internal event queue from
+            // growing unbounded for the whole play session. Only the
+            // *reaction* to those events needs to be suppressed here -
+            // see `AppData::minecraft_running`'s doc comment for why
+            // gilrs itself can't tell that our window lost focus.
+            if state_for_gp.lock().unwrap().minecraft_running {
+                return glib::ControlFlow::Continue;
+            }
             for gilrs::Event { event, .. } in events {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
