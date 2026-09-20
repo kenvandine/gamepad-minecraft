@@ -815,14 +815,19 @@ fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
         Some(widget) => widget.grab_focus(),
         None => false,
     };
-    // TEMPORARY: diagnosing D-Pad navigation skipping rows even with a
-    // single, clean ButtonPressed event (confirmed via the [gilrs]
-    // trace) - logging by label text so we can compare what the code
-    // actually did against what's visually highlighted on screen.
+    // TEMPORARY: a real device trace showed the *intended* target
+    // (`next`, logged as `after` previously) consistently one row
+    // short of what actually ended up highlighted on screen - i.e.
+    // grab_focus() was called correctly, but something moved focus one
+    // further step before it settled. Re-querying focus after the call
+    // (`actually_focused_after`) instead of trusting `next` should show
+    // that gap directly.
+    let actually_focused_after = gtk::prelude::RootExt::focus(window);
     eprintln!(
-        "[focus] step forward={forward} before={:?} after={:?} moved={moved}",
+        "[focus] step forward={forward} before={:?} intended_next={:?} moved={moved} actually_focused_after={:?}",
         widget_label(&focused),
         next.as_ref().and_then(widget_label),
+        actually_focused_after.as_ref().and_then(widget_label),
     );
     moved
 }
