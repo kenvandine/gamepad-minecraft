@@ -793,47 +793,95 @@ fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     widgets.focus_default_for(View::Settings);
 }
 
-/// Moves focus to the previous/next sibling of whatever's currently
-/// focused, instead of GTK's generic geometric `child_focus` search
-/// (PLAN.md §5, lesson 4). That search is unreliable across a tall
-/// stack of same-sized buttons - the exact bug gamepad-2048 hit for its
+/// Moves focus to the next/previous focusable widget in document order,
+/// instead of GTK's generic geometric `child_focus` search (PLAN.md §5,
+/// lesson 4). That search is unreliable across a tall stack of
+/// same-sized buttons - the exact bug gamepad-2048 hit for its
 /// board-size row - and manifests here on any of the longer lists
 /// (version picker, instance grid, accounts, settings): Up/Down would
 /// unpredictably skip several rows at once instead of moving one at a
-/// time. Every screen here lays its focusable controls out as flat
-/// siblings in a single vertical `gtk::Box`, so "the literal next/
-/// previous sibling" is exactly "the next item down/up" - this needs no
-/// per-screen knowledge of which list is active. Deliberately doesn't
-/// wrap at the ends, same as gamepad-2048's own documented behavior.
+/// time.
+///
+/// Most screens lay their focusable controls out as flat siblings in a
+/// single vertical `gtk::Box`, where "the literal next/previous
+/// sibling" is exactly "the next item down/up". But Home and Accounts
+/// nest their list of tiles inside its own `gtk::Box` (`instance_list`,
+/// `accounts_list`) with the "Add" button as a sibling of *that box*,
+/// not of the tiles inside it - so a flat sibling-only walk can never
+/// step off the last tile onto "Add". `focus_relative` below climbs to
+/// the parent and keeps looking there once a container's own siblings
+/// are exhausted, and descends into a sibling that's itself a container
+/// to find its first/last focusable descendant - a real (if small)
+/// preorder tree walk rather than a single sibling hop. It stops dead
+/// at each screen's own top-level page `Box` (detected by the page
+/// being a direct child of `stack`) rather than climbing further, so it
+/// can never wrap around into a different, hidden page's own widgets.
+/// Deliberately doesn't wrap at the ends of a screen, same as
+/// gamepad-2048's own documented behavior.
 fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
     let Some(focused) = gtk::prelude::RootExt::focus(window) else {
         eprintln!("[focus] step forward={forward}: nothing focused");
         return false;
     };
-    let next = if forward {
-        focused.next_sibling()
-    } else {
-        focused.prev_sibling()
-    };
-    let moved = match &next {
-        Some(widget) => widget.grab_focus(),
-        None => false,
-    };
-    // TEMPORARY: a real device trace showed the *intended* target
-    // (`next`, logged as `after` previously) consistently one row
-    // short of what actually ended up highlighted on screen - i.e.
-    // grab_focus() was called correctly, but something moved focus one
-    // further step before it settled. Re-querying focus after the call
-    // (`actually_focused_after`) instead of trusting `next` should show
-    // that gap directly.
+    let moved = focus_relative(&focused, forward);
     let actually_focused_after = gtk::prelude::RootExt::focus(window);
     eprintln!(
-        "[focus] step forward={forward} before={:?} intended_next={:?} moved={moved} actually_focused_after={:?}",
+        "[focus] step forward={forward} before={:?} moved={moved} actually_focused_after={:?}",
         widget_label(&focused),
-        next.as_ref().and_then(widget_label),
         actually_focused_after.as_ref().and_then(widget_label),
     );
     moved
+}
+
+/// Walks from `from` to the next (or, if `!forward`, previous) focusable
+/// widget in document order and focuses it. See `step_focus` for why
+/// this needs to climb parents and descend into sibling containers
+/// rather than just checking one sibling.
+fn focus_relative(from: &gtk::Widget, forward: bool) -> bool {
+    let mut node = from.clone();
+    loop {
+        let sibling = if forward { node.next_sibling() } else { node.prev_sibling() };
+        match sibling {
+            Some(candidate) => {
+                if focus_into(&candidate, forward) {
+                    return true;
+                }
+                // `candidate` and everything inside it declined focus
+                // (e.g. a Label) - keep scanning past it.
+                node = candidate;
+            }
+            None => {
+                let Some(parent) = node.parent() else {
+                    return false;
+                };
+                // Never escape the current Stack page - each page's
+                // top-level Box is a traversal boundary, so this can't
+                // wrap into a completely different (hidden) page's own
+                // widgets by climbing too far.
+                if parent.downcast_ref::<gtk::Stack>().is_some() {
+                    return false;
+                }
+                node = parent;
+            }
+        }
+    }
+}
+
+/// Tries to focus `widget` itself, or - if it can't take focus directly
+/// - the first (or last, going backward) focusable widget among its own
+/// descendants, checked in order.
+fn focus_into(widget: &gtk::Widget, forward: bool) -> bool {
+    if widget.grab_focus() {
+        return true;
+    }
+    let mut child = if forward { widget.first_child() } else { widget.last_child() };
+    while let Some(c) = child {
+        if focus_into(&c, forward) {
+            return true;
+        }
+        child = if forward { c.next_sibling() } else { c.prev_sibling() };
+    }
+    false
 }
 
 fn widget_label(widget: &gtk::Widget) -> Option<String> {
