@@ -1144,6 +1144,10 @@ fn build_ui(app: &Application) {
     add_instance_btn.set_css_classes(&["action-button"]);
     home_page.append(&add_instance_btn);
 
+    let quit_btn = gtk::Button::with_label("Quit");
+    quit_btn.set_css_classes(&["action-button"]);
+    home_page.append(&quit_btn);
+
     let home_hint = gtk::Label::new(Some(
         "A: Select  •  B: Quit  •  X: Accounts  •  Y: Settings",
     ));
@@ -1301,6 +1305,10 @@ fn build_ui(app: &Application) {
         let widgets = widgets.clone();
         add_instance_btn
             .connect_clicked(move |_| open_version_picker(state.clone(), widgets.clone()));
+    }
+    {
+        let window = window.clone();
+        quit_btn.connect_clicked(move |_| window.close());
     }
     {
         let state = state.clone();
