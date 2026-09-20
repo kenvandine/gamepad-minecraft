@@ -10,6 +10,7 @@
 //! PLAN.md §7.
 
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -155,6 +156,29 @@ pub fn extract_natives(instance: &InstanceMeta, profile: &LaunchProfile) -> Resu
     Ok(natives_dir)
 }
 
+/// Forces `fullscreen:true` in the instance's `options.txt`, preserving
+/// every other line as-is (a returning player's other settings, if the
+/// file already exists from a previous launch). Minecraft reads this at
+/// startup; there's no reliable command-line/launch-argument equivalent
+/// across versions, and a controller-only launcher can't assume a mouse
+/// is available to toggle it manually in Minecraft's own video settings.
+fn ensure_fullscreen_option(instance: &InstanceMeta) -> Result<(), String> {
+    let path = InstanceStore::instance_dir(&instance.id).join("options.txt");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    fs::write(&path, force_fullscreen_true(&existing)).map_err(|e| e.to_string())
+}
+
+/// Pure line-rewriting logic behind `ensure_fullscreen_option`, split
+/// out so it's testable without touching a real instance directory.
+fn force_fullscreen_true(existing_options_txt: &str) -> String {
+    let mut lines: Vec<String> = existing_options_txt.lines().map(str::to_string).collect();
+    match lines.iter_mut().find(|line| line.starts_with("fullscreen:")) {
+        Some(line) => *line = "fullscreen:true".to_string(),
+        None => lines.push("fullscreen:true".to_string()),
+    }
+    lines.join("\n") + "\n"
+}
+
 /// Spawns Minecraft for `instance` as `account` and blocks until it
 /// exits, reporting `LaunchEvent`s via `on_event` (`Started` once the
 /// process is up, then `Exited`/`Crashed` when it's done). Meant to be
@@ -169,6 +193,12 @@ pub fn spawn_minecraft(
 ) -> Result<(), String> {
     let profile = LaunchProfile::load(&instance.id)
         .map_err(|e| format!("instance is not installed yet: {e}"))?;
+
+    // A controller-first launcher can't assume a mouse is available to
+    // dig into Minecraft's own video-settings menu, so force fullscreen
+    // in options.txt before every launch rather than relying on the
+    // player to have set it manually.
+    ensure_fullscreen_option(instance)?;
 
     let natives_dir = extract_natives(instance, &profile)?;
     let classpath_paths = build_classpath(instance, &profile);
@@ -207,6 +237,23 @@ pub fn spawn_minecraft(
 mod tests {
     use super::*;
     use crate::instance::{InstallState, Loader};
+
+    #[test]
+    fn force_fullscreen_true_appends_when_missing() {
+        let result = force_fullscreen_true("gamma:2.0\nrenderDistance:12");
+        assert_eq!(result, "gamma:2.0\nrenderDistance:12\nfullscreen:true\n");
+    }
+
+    #[test]
+    fn force_fullscreen_true_replaces_existing_value() {
+        let result = force_fullscreen_true("gamma:2.0\nfullscreen:false\nrenderDistance:12");
+        assert_eq!(result, "gamma:2.0\nfullscreen:true\nrenderDistance:12\n");
+    }
+
+    #[test]
+    fn force_fullscreen_true_handles_empty_file() {
+        assert_eq!(force_fullscreen_true(""), "fullscreen:true\n");
+    }
 
     fn test_instance() -> InstanceMeta {
         InstanceMeta {
