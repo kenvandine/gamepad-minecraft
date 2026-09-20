@@ -848,7 +848,7 @@ fn widget_label(widget: &gtk::Widget) -> Option<String> {
 // press could step several rows at once - which is exactly what
 // "skips rows" looked like, even though each individual `step_focus`
 // call only ever moves one row on its own.
-const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// Steps focus unless another accepted step (from *either* input path)
 /// happened within `DPAD_NAV_DEBOUNCE`. `gate` must be shared between

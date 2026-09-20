@@ -207,6 +207,18 @@ pub fn spawn_minecraft(
     let jvm_args = build_jvm_args(instance, &profile, account, access_token, &natives_dir, &classpath);
     let game_args = build_game_args(instance, &profile, account, access_token, &natives_dir, &classpath);
 
+    // TEMPORARY: diagnosing "GLFW X11: The DISPLAY environment variable
+    // is missing" on the packaged snap only (cargo run is fine) - the
+    // child inherits our own process's environment by default, so
+    // whatever's missing here is what LWJGL/GLFW would see too.
+    eprintln!(
+        "[launch] DISPLAY={:?} WAYLAND_DISPLAY={:?} XDG_SESSION_TYPE={:?} XDG_RUNTIME_DIR={:?}",
+        std::env::var("DISPLAY"),
+        std::env::var("WAYLAND_DISPLAY"),
+        std::env::var("XDG_SESSION_TYPE"),
+        std::env::var("XDG_RUNTIME_DIR"),
+    );
+
     let mut command = Command::new(java_binary());
     command
         .current_dir(InstanceStore::instance_dir(&instance.id))
