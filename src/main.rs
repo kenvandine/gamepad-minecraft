@@ -78,10 +78,6 @@ impl Widgets {
     /// must call this — a revealer/page swap without a refocus call was
     /// gamepad-2048's single biggest bug class (PLAN.md §5, lesson 2).
     fn focus_default_for(&self, view: View) {
-        // TEMPORARY: ruling this out as the source of an unexplained
-        // extra focus step seen between two D-Pad presses with no
-        // gilrs event or step_focus call logged in between.
-        eprintln!("[focus_default_for] view={view:?}");
         self.stack.set_visible_child_name(view_name(view));
         match view {
             View::Login => {
@@ -820,17 +816,9 @@ fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
 /// gamepad-2048's own documented behavior.
 fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
     let Some(focused) = gtk::prelude::RootExt::focus(window) else {
-        eprintln!("[focus] step forward={forward}: nothing focused");
         return false;
     };
-    let moved = focus_relative(&focused, forward);
-    let actually_focused_after = gtk::prelude::RootExt::focus(window);
-    eprintln!(
-        "[focus] step forward={forward} before={:?} moved={moved} actually_focused_after={:?}",
-        widget_label(&focused),
-        actually_focused_after.as_ref().and_then(widget_label),
-    );
-    moved
+    focus_relative(&focused, forward)
 }
 
 /// Walks from `from` to the next (or, if `!forward`, previous) focusable
@@ -882,13 +870,6 @@ fn focus_into(widget: &gtk::Widget, forward: bool) -> bool {
         child = if forward { c.next_sibling() } else { c.prev_sibling() };
     }
     false
-}
-
-fn widget_label(widget: &gtk::Widget) -> Option<String> {
-    widget
-        .downcast_ref::<gtk::Button>()
-        .and_then(|b| b.label())
-        .map(|s| s.to_string())
 }
 
 // A physical D-Pad press can arrive as more than one discrete
@@ -1366,7 +1347,6 @@ fn build_ui(app: &Application) {
         let state_for_gp = state.clone();
         let widgets_for_gp = widgets.clone();
         let dpad_nav_gate_gp = Rc::new(RefCell::new(std::time::Instant::now() - DPAD_NAV_DEBOUNCE));
-        let trace_epoch = std::time::Instant::now();
         glib::source::timeout_add_local(std::time::Duration::from_millis(16), move || {
             let events: Vec<gilrs::Event> = {
                 let mut gp = gilrs.borrow_mut();
@@ -1377,13 +1357,6 @@ fn build_ui(app: &Application) {
                 events
             };
             for gilrs::Event { event, .. } in events {
-                // TEMPORARY: tracing every raw gilrs event to diagnose
-                // version-picker D-Pad navigation skipping rows
-                // inconsistently on real hardware - remove once
-                // understood. Printed unconditionally to stderr so it
-                // shows up when run from a terminal without needing a
-                // rebuild with a debug flag.
-                eprintln!("[gilrs] t={:>6}ms {:?}", trace_epoch.elapsed().as_millis(), event);
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     match button {
                         gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
