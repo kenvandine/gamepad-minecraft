@@ -1269,16 +1269,21 @@ fn build_ui(app: &Application) {
         let gamepad_connected = gilrs_for_kb
             .as_ref()
             .is_some_and(|g| g.borrow().gamepads().any(|(_, gp)| gp.is_connected()));
-        // TEMPORARY: an unexplained focus step happened between two
-        // logged D-Pad presses with zero gilrs events AND zero
-        // step_focus calls in between - logging every raw key event
-        // reaching the window (matched or not) to check whether a GDK
-        // key event is arriving there that the gamepad-connected gate
-        // is nonetheless letting slip through, or arriving at all.
-        eprintln!("[key] {key:?} gamepad_connected={gamepad_connected}");
-        match key {
+        let handled = match key {
             Key::Up if !gamepad_connected => step_focus(&widgets_kb.window, false),
             Key::Down if !gamepad_connected => step_focus(&widgets_kb.window, true),
+            // Found via a real device trace: `Key(65364)` (GDK_KEY_Down)
+            // events keep arriving here even with a gamepad connected -
+            // Steam Input synthesizes a keyboard echo of the D-Pad
+            // press. Declining to act on it wasn't enough: returning
+            // Propagation::Proceed for it (as the catch-all arm below
+            // does) let GTK's *own* default arrow-key-to-focus
+            // keybinding also process the same event afterward, moving
+            // focus a second time through a path neither `step_focus`
+            // nor anything else in this file ever sees or logs. These
+            // two keys must be swallowed outright whenever a gamepad
+            // is connected, not just left unhandled.
+            Key::Up | Key::Down if gamepad_connected => true,
             Key::Left => widgets_kb.window.child_focus(gtk::DirectionType::Left),
             Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
             Key::Escape => {
@@ -1295,7 +1300,11 @@ fn build_ui(app: &Application) {
             }
             _ => false,
         };
-        glib::Propagation::Proceed
+        if handled {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
     });
     window.add_controller(key_controller);
 
