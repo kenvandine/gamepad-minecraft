@@ -1,7 +1,7 @@
 name: gamepad-minecraft
 title: Minecraft - Gamepad
 base: core24
-version: '0.1.0'
+version: '0.2.0'
 summary: A controller-friendly Minecraft Java launcher for handhelds
 description: |
   Play Minecraft Java Edition entirely with a gamepad - no keyboard or

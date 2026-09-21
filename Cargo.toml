@@ -1,6 +1,6 @@
 [package]
 name = "gamepad-minecraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A controller-first Minecraft Java launcher for Ubuntu handhelds"
 license = "GPL-3.0-or-later"
