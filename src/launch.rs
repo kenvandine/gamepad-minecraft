@@ -156,41 +156,6 @@ pub fn extract_natives(instance: &InstanceMeta, profile: &LaunchProfile) -> Resu
     Ok(natives_dir)
 }
 
-/// Whether the GLFW native under `natives_dir` was built with a Wayland
-/// backend. LWJGL versions new enough to support Wayland at all call
-/// `getenv("WAYLAND_DISPLAY")` from within `libglfw.so` itself to decide
-/// which platform to use, so that string's presence in the binary is a
-/// direct, version-agnostic signal - unlike parsing the LWJGL version
-/// number, it can't drift out of sync with what a given native actually
-/// supports.
-fn native_glfw_supports_wayland(natives_dir: &std::path::Path) -> bool {
-    fn find_glfw(dir: &std::path::Path) -> Option<PathBuf> {
-        for entry in fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_glfw(&path) {
-                    return Some(found);
-                }
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("libglfw") && n.ends_with(".so"))
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
-
-    let Some(glfw_path) = find_glfw(natives_dir) else {
-        return false;
-    };
-    let Ok(bytes) = fs::read(&glfw_path) else {
-        return false;
-    };
-    bytes.windows(b"WAYLAND_DISPLAY".len()).any(|w| w == b"WAYLAND_DISPLAY")
-}
-
 /// Forces `fullscreen:true` in the instance's `options.txt`, preserving
 /// every other line as-is (a returning player's other settings, if the
 /// file already exists from a previous launch). Minecraft reads this at
@@ -320,21 +285,6 @@ pub fn spawn_minecraft(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-
-    // The session exports a stale `DISPLAY=:0` even before anything has
-    // asked the compositor to stand up Xwayland for it, and GLFW's own
-    // platform auto-detection sees that and tries X11 first - which
-    // races the lazy Xwayland startup and can lose, crashing with "GLFW
-    // X11: Failed to open display :0" even on instances that could have
-    // rendered natively over the Wayland socket that's already up.
-    // Older Minecraft/LWJGL builds only ship an X11-capable GLFW native
-    // with no Wayland support at all, so this can't be a blanket
-    // override - only skip the X11 race for instances whose native GLFW
-    // actually has a Wayland backend to fall back on.
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() && native_glfw_supports_wayland(&natives_dir) {
-        command.env_remove("DISPLAY");
-        command.env("XDG_SESSION_TYPE", "wayland");
-    }
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     on_event(LaunchEvent::Started);
