@@ -207,7 +207,61 @@ pub fn inject_controlify_mod(instance: &InstanceMeta) -> Result<(), HttpError> {
     download_modrinth_mod("fabric-api", &instance.mc_version, &mods_dir)?;
     download_modrinth_mod("yacl", &instance.mc_version, &mods_dir)?;
     download_modrinth_mod("controlify", &instance.mc_version, &mods_dir)?;
+    seed_controlify_mixed_input(instance)?;
     Ok(())
+}
+
+/// Controlify's own config schema version as of the build this launcher
+/// currently injects (`ControlifyDataFixer.CURRENT_VERSION`, confirmed
+/// live by reading Controlify's own source). Any value in Controlify's
+/// "split config" range - above its frozen legacy boundary of 2, up to
+/// whatever a future Controlify build's own `CURRENT_VERSION` is - gets
+/// transparently upgraded by Controlify's own DataFixerUpper before it's
+/// ever read, so this doesn't need bumping just because Controlify ships
+/// a newer schema later; it only breaks if a future Controlify build's
+/// `CURRENT_VERSION` regresses below this, which schema versions don't.
+const CONTROLIFY_SCHEMA_VERSION: u32 = 8;
+
+/// Seeds `instance`'s Controlify config with Mixed Input already on,
+/// before Controlify has ever run - so even the player's very first play
+/// session is covered by the same fix `launch::ensure_controlify_mixed_input`
+/// applies from the second launch onward (see that function's doc comment
+/// for why this controller-only device needs Mixed Input forced on at all).
+/// A no-op if the instance somehow already has a config (never true for a
+/// freshly installed instance, but keeps this safe to call more than once).
+///
+/// Deliberately writes only `schema_version` and the one `global.mixed_input`
+/// key we need changed, rather than hand-authoring Controlify's full config
+/// schema: confirmed live by reading `ConfigMigrator`'s own source that any
+/// split-schema config missing fields is completed by deep-merging it onto
+/// Controlify's own freshly-generated defaults before decoding, so this
+/// seed inherits every other default from Controlify itself and survives
+/// Controlify adding, removing, or renaming unrelated fields later.
+fn seed_controlify_mixed_input(instance: &InstanceMeta) -> Result<(), HttpError> {
+    let config_dir = InstanceStore::instance_dir(&instance.id)
+        .join("config")
+        .join("controlify");
+    let path = config_dir.join("controlify.json");
+    if path.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&config_dir).map_err(|e| HttpError(e.to_string()))?;
+    let json = serde_json::to_string_pretty(&controlify_mixed_input_seed())
+        .map_err(|e| HttpError(e.to_string()))?;
+    fs::write(&path, json).map_err(|e| HttpError(e.to_string()))
+}
+
+/// The minimal `controlify.json` seed content itself, split out from
+/// `seed_controlify_mixed_input` so it's testable without touching a real
+/// instance directory.
+fn controlify_mixed_input_seed() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CONTROLIFY_SCHEMA_VERSION,
+        "global": {
+            "mixed_input": true
+        }
+    })
 }
 
 #[cfg(test)]
@@ -233,5 +287,20 @@ mod tests {
     #[test]
     fn maven_path_rejects_malformed_coordinates() {
         assert_eq!(maven_path("not-a-coordinate"), None);
+    }
+
+    #[test]
+    fn controlify_mixed_input_seed_sets_mixed_input_true() {
+        let seed = controlify_mixed_input_seed();
+        assert_eq!(seed["global"]["mixed_input"], true);
+        assert_eq!(seed["schema_version"], CONTROLIFY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn controlify_mixed_input_seed_schema_version_is_in_split_schema_range() {
+        // Controlify's ConfigMigrator rejects (and refuses to start with)
+        // any schema_version <= 2 (its frozen legacy boundary) - confirmed
+        // live by reading ConfigMigrator's own source.
+        assert!(CONTROLIFY_SCHEMA_VERSION > 2);
     }
 }
