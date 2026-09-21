@@ -7,6 +7,7 @@
 //! Minecraft's own title screen and in-game menus are gamepad-navigable
 //! without a keyboard or mouse — see PLAN.md §1.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -171,6 +172,24 @@ fn download_modrinth_mod(slug: &str, mc_version: &str, mods_dir: &Path) -> Resul
 
     fs::create_dir_all(mods_dir).map_err(|e| HttpError(e.to_string()))?;
     crate::net::download_and_verify(&file.url, &mods_dir.join(&file.filename), 0, &file.hashes.sha1)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthVersionGameVersions {
+    game_versions: Vec<String>,
+}
+
+/// Every Minecraft release Controlify has published a Fabric build for.
+/// This launcher is controller-only, so a Minecraft version Controlify
+/// hasn't caught up to yet (confirmed live over the 2026-09-19 weekend:
+/// 26.3 has no Controlify build at all) isn't a playable choice here -
+/// the version picker uses this to keep such versions off the list
+/// rather than letting the player hit an install failure after the
+/// fact.
+pub fn fetch_controlify_supported_versions() -> Result<HashSet<String>, HttpError> {
+    let url = format!("{MODRINTH_API}/project/controlify/version?loaders=[\"fabric\"]");
+    let versions: Vec<ModrinthVersionGameVersions> = crate::net::get_json(&url)?;
+    Ok(versions.into_iter().flat_map(|v| v.game_versions).collect())
 }
 
 /// Drops Controlify and its required dependencies (Fabric API,

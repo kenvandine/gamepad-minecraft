@@ -446,44 +446,60 @@ fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
 
     let state1 = state.clone();
     let widgets1 = widgets.clone();
-    net::spawn_blocking(instance::fetch_version_manifest, move |result| {
-        let manifest = match result {
-            Ok(m) => m,
-            Err(e) => {
-                widgets1
-                    .version_status_label
-                    .set_label(&format!("Couldn't fetch version list: {e}"));
-                return;
-            }
-        };
-        widgets1
-            .version_status_label
-            .set_label(&format!("{VERSION_PICKER_LIMIT} most recent releases:"));
-
-        let releases = manifest
-            .versions
-            .iter()
-            .filter(|v| v.kind == "release")
-            .take(VERSION_PICKER_LIMIT);
-        for entry in releases {
-            let label = if entry.id == manifest.latest.release {
-                format!("{} (latest)", entry.id)
-            } else {
-                entry.id.clone()
+    net::spawn_blocking(
+        // Combined into one background job (rather than two independent
+        // `spawn_blocking` calls) so the list is only ever rendered once
+        // both are in - filtering needs Controlify's supported-version
+        // set before it can decide what to show at all.
+        || {
+            let manifest = instance::fetch_version_manifest()?;
+            let controlify_versions = fabric::fetch_controlify_supported_versions()?;
+            Ok((manifest, controlify_versions))
+        },
+        move |result| {
+            let (manifest, controlify_versions) = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    widgets1
+                        .version_status_label
+                        .set_label(&format!("Couldn't fetch version list: {e}"));
+                    return;
+                }
             };
-            let btn = gtk::Button::with_label(&label);
-            btn.set_css_classes(&["action-button"]);
+            widgets1
+                .version_status_label
+                .set_label(&format!("{VERSION_PICKER_LIMIT} most recent releases:"));
 
-            let state2 = state1.clone();
-            let widgets2 = widgets1.clone();
-            let mc_version = entry.id.clone();
-            btn.connect_clicked(move |_| {
-                open_or_install_version(state2.clone(), widgets2.clone(), mc_version.clone())
-            });
-            widgets1.version_list.append(&btn);
-        }
-        widgets1.focus_default_for(View::VersionPicker);
-    });
+            // Only releases Controlify has a Fabric build for are offered -
+            // anything newer that Controlify hasn't caught up to yet would
+            // otherwise install and then leave the player with no
+            // controller input in-game at all.
+            let releases: Vec<_> = manifest
+                .versions
+                .iter()
+                .filter(|v| v.kind == "release" && controlify_versions.contains(&v.id))
+                .take(VERSION_PICKER_LIMIT)
+                .collect();
+            for (i, entry) in releases.into_iter().enumerate() {
+                let label = if i == 0 {
+                    format!("{} (latest supported)", entry.id)
+                } else {
+                    entry.id.clone()
+                };
+                let btn = gtk::Button::with_label(&label);
+                btn.set_css_classes(&["action-button"]);
+
+                let state2 = state1.clone();
+                let widgets2 = widgets1.clone();
+                let mc_version = entry.id.clone();
+                btn.connect_clicked(move |_| {
+                    open_or_install_version(state2.clone(), widgets2.clone(), mc_version.clone())
+                });
+                widgets1.version_list.append(&btn);
+            }
+            widgets1.focus_default_for(View::VersionPicker);
+        },
+    );
 }
 
 /// Adds `mc_version` as a new instance and starts installing it, unless
