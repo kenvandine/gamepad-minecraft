@@ -276,18 +276,6 @@ pub fn spawn_minecraft(
     let jvm_args = build_jvm_args(instance, &profile, account, access_token, &natives_dir, &classpath);
     let game_args = build_game_args(instance, &profile, account, access_token, &natives_dir, &classpath);
 
-    // TEMPORARY: diagnosing "GLFW X11: The DISPLAY environment variable
-    // is missing" on the packaged snap only (cargo run is fine) - the
-    // child inherits our own process's environment by default, so
-    // whatever's missing here is what LWJGL/GLFW would see too.
-    eprintln!(
-        "[launch] DISPLAY={:?} WAYLAND_DISPLAY={:?} XDG_SESSION_TYPE={:?} XDG_RUNTIME_DIR={:?}",
-        std::env::var("DISPLAY"),
-        std::env::var("WAYLAND_DISPLAY"),
-        std::env::var("XDG_SESSION_TYPE"),
-        std::env::var("XDG_RUNTIME_DIR"),
-    );
-
     let mut command = Command::new(java_binary());
     command
         .current_dir(InstanceStore::instance_dir(&instance.id))
@@ -297,6 +285,20 @@ pub fn spawn_minecraft(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+
+    // These handhelds run a Wayland-only compositor with no Xwayland, but
+    // the session still exports a stale `DISPLAY=:0` left over from the
+    // desktop environment defaults. GLFW's own platform auto-detection
+    // sees that and tries X11 first, which then fails to open a display
+    // that was never backed by a real X server - crashing every launch
+    // with "GLFW X11: Failed to open display :0" even though the real
+    // Wayland socket is right there and working. Since a real Wayland
+    // socket is the ground truth for whether this session can render at
+    // all, prefer it explicitly rather than trust GLFW's own guess.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        command.env_remove("DISPLAY");
+        command.env("XDG_SESSION_TYPE", "wayland");
+    }
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     on_event(LaunchEvent::Started);
