@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn renders_a_square_buffer() {
-        let img = render_verification_qr("https://microsoft.com/link?otc=ABCD1234", 4).unwrap();
+        let img = render_verification_qr("https://microsoft.com/link", 4).unwrap();
         assert_eq!(img.width, img.height);
         assert_eq!(img.rgba.len(), (img.width * img.height * 4) as usize);
     }

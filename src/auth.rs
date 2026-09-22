@@ -51,11 +51,15 @@ pub struct DeviceCodeResponse {
     pub interval: u64,
 }
 
-/// Builds the QR-code payload for a device-code response: the
-/// verification URI with the user code pre-filled via `otc`, so scanning
-/// the code on a phone skips the manual-entry step (PLAN.md §2).
+/// Builds the QR-code payload for a device-code response: just the bare
+/// verification URI (PLAN.md §2). Scanning it gets the phone to the right
+/// page, but the user still has to type the on-screen code manually -
+/// appending `?otc=` to pre-fill it looks convenient but redirects
+/// straight into `oauth20_remoteconnect.srf`, which rejects first-party
+/// client IDs (like the Minecraft Launcher one this app uses) with an
+/// immediate "not permitted to consent" error.
 pub fn qr_payload(device: &DeviceCodeResponse) -> String {
-    format!("{}?otc={}", device.verification_uri, device.user_code)
+    device.verification_uri.clone()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -427,7 +431,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qr_payload_appends_otc() {
+    fn qr_payload_is_bare_verification_uri() {
         let device = DeviceCodeResponse {
             device_code: "dc".into(),
             user_code: "B7DK-9LPQ".into(),
@@ -435,10 +439,7 @@ mod tests {
             expires_in: 900,
             interval: 5,
         };
-        assert_eq!(
-            qr_payload(&device),
-            "https://microsoft.com/link?otc=B7DK-9LPQ"
-        );
+        assert_eq!(qr_payload(&device), "https://microsoft.com/link");
     }
 
     #[test]
