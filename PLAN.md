@@ -74,6 +74,7 @@ enum AuthState {
     Resolving,                                   // startup, before cache is read
     NeedsLogin { cached: Option<CachedAccount> }, // cached = Some enables offline play
     AwaitingUser { qr_data, user_code, verification_uri, expires_at },
+    Verifying { profile: CachedAccount },         // MSA refresh confirmed valid, Mojang chain still in flight
     LoggedIn { profile: McProfile },              // fresh/refreshed online session
     OfflinePlaying { profile: CachedAccount },     // not validating online, by choice or necessity
     Error { message: String, cached: Option<CachedAccount> },
@@ -123,7 +124,7 @@ screen, not a resizable desktop window.
 
 | Page | Default focus | A / Confirm | B / Back |
 |---|---|---|---|
-| `Login` | "Sign in" (no cache) or "Play Offline" (cache exists) | Activates focused widget | Cancels device-code polling if active, else quits |
+| `Login` | "Sign in" (only reached when no account has ever been cached) | Activates focused widget | Cancels device-code polling if active, else quits |
 | `Home` | First instance tile, or "Add Instance" if none exist | Launch focused instance | Quit-confirm overlay |
 | `InstanceDetail` | "Play" | Play / Update / Delete per focused button | Back to `Home`, refocusing the tile just left |
 | `Accounts` (X) | Active account row | Switch active account | Back to `Home` |

@@ -193,6 +193,11 @@ fn render_auth_state(widgets: &Widgets, auth: &auth::AuthState) {
             widgets.sign_in_btn.set_sensitive(false);
             widgets.sign_in_btn.set_label("Waiting for approval...");
         }
+        auth::AuthState::Verifying { profile } => {
+            widgets
+                .home_status_label
+                .set_label(&format!("Signed in as {} - verifying...", profile.username));
+        }
         auth::AuthState::LoggedIn { profile } => {
             widgets
                 .home_status_label
@@ -703,6 +708,96 @@ fn do_launch(
     );
 }
 
+/// Opportunistic silent sign-in, run once at startup right after Home
+/// has already rendered from the cached profile (PLAN.md §3: "Home
+/// renders immediately from the cached profile either way"). Runs the
+/// MSA refresh and the XBL/XSTS/Mojang chain as two separate network
+/// stages rather than one combined call, so `Verifying` shows the moment
+/// the cheap first call confirms the cached credential is still valid,
+/// instead of the UI staying silent for the full four-request round
+/// trip. A failure at either stage is never surfaced as an error - the
+/// player is simply left on the offline identity they already had, same
+/// as a failed refresh at launch time in `start_launch_instance`.
+fn start_silent_refresh(state: &Arc<Mutex<AppData>>, widgets: &Widgets, account: CachedAccount) {
+    let Some(refresh_token) = account.refresh_token.clone() else {
+        return;
+    };
+    let state2 = state.clone();
+    let widgets2 = widgets.clone();
+    net::spawn_blocking(
+        move || auth::refresh_silently(&refresh_token),
+        move |result| {
+            // Only act if nothing has moved the player on since this
+            // refresh started (e.g. they haven't already switched
+            // accounts or picked a different sign-in state by hand).
+            if !matches!(state2.lock().unwrap().auth, auth::AuthState::LoggedIn { .. }) {
+                return;
+            }
+            let msa = match result {
+                Ok(msa) => msa,
+                Err(_) => {
+                    fall_back_to_offline(&state2, &widgets2);
+                    return;
+                }
+            };
+
+            let verifying = auth::AuthState::Verifying {
+                profile: account.clone(),
+            };
+            state2.lock().unwrap().auth = verifying.clone();
+            render_auth_state(&widgets2, &verifying);
+
+            let state3 = state2.clone();
+            let widgets3 = widgets2.clone();
+            let refresh_token = msa.refresh_token.clone();
+            let access_token = msa.access_token.clone();
+            net::spawn_blocking(
+                move || auth::complete_mojang_login(&access_token),
+                move |result| {
+                    if !matches!(state3.lock().unwrap().auth, auth::AuthState::Verifying { .. }) {
+                        return;
+                    }
+                    match result {
+                        Ok(session) => {
+                            let cached = account::CachedAccount {
+                                username: session.profile.name.clone(),
+                                uuid: session.profile.id.clone(),
+                                refresh_token: Some(refresh_token),
+                                obtained_at: chrono::Local::now()
+                                    .format("%Y-%m-%d %H:%M")
+                                    .to_string(),
+                            };
+                            let new_auth = auth::AuthState::LoggedIn {
+                                profile: session.profile,
+                            };
+                            {
+                                let mut data = state3.lock().unwrap();
+                                data.accounts.upsert(cached);
+                                let _ = data.accounts.save();
+                                data.auth = new_auth.clone();
+                            }
+                            render_auth_state(&widgets3, &new_auth);
+                        }
+                        Err(_) => fall_back_to_offline(&state3, &widgets3),
+                    }
+                },
+            );
+        },
+    );
+}
+
+/// Shared failure path for `start_silent_refresh`'s two stages: drop
+/// back to the cached offline identity without surfacing an error
+/// (PLAN.md §3).
+fn fall_back_to_offline(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let profile = state.lock().unwrap().accounts.active().cloned();
+    if let Some(profile) = profile {
+        let new_auth = auth::AuthState::OfflinePlaying { profile };
+        state.lock().unwrap().auth = new_auth.clone();
+        render_auth_state(widgets, &new_auth);
+    }
+}
+
 // ─── Accounts ───────────────────────────────────────────────────────
 // Switching or adding an account is Home-adjacent, not its own auth
 // flow: switching just re-points AppData.accounts.active_uuid and
@@ -739,23 +834,32 @@ fn refresh_accounts_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     }
 }
 
+/// Derives an optimistic `AuthState` from a cached account with no
+/// network call: `LoggedIn` if it has a refresh token (upgraded to a
+/// freshly-verified session by a silent refresh shortly after, see
+/// `start_silent_refresh`), `OfflinePlaying` otherwise. `None` means no
+/// account has ever been cached at all.
+fn auth_state_for_cached(account: Option<&CachedAccount>) -> auth::AuthState {
+    match account {
+        Some(account) if account.refresh_token.is_some() => auth::AuthState::LoggedIn {
+            profile: auth::McProfile {
+                id: account.uuid.clone(),
+                name: account.username.clone(),
+            },
+        },
+        Some(account) => auth::AuthState::OfflinePlaying {
+            profile: account.clone(),
+        },
+        None => auth::AuthState::NeedsLogin { cached: None },
+    }
+}
+
 fn switch_active_account(state: &Arc<Mutex<AppData>>, widgets: &Widgets, uuid: String) {
     let new_auth = {
         let mut data = state.lock().unwrap();
         data.accounts.active_uuid = Some(uuid);
         let _ = data.accounts.save();
-        let auth_state = match data.accounts.active() {
-            Some(account) if account.refresh_token.is_some() => auth::AuthState::LoggedIn {
-                profile: auth::McProfile {
-                    id: account.uuid.clone(),
-                    name: account.username.clone(),
-                },
-            },
-            Some(account) => auth::AuthState::OfflinePlaying {
-                profile: account.clone(),
-            },
-            None => auth::AuthState::NeedsLogin { cached: None },
-        };
+        let auth_state = auth_state_for_cached(data.accounts.active());
         data.auth = auth_state.clone();
         data.view = View::Home;
         auth_state
@@ -1288,9 +1392,15 @@ fn build_ui(app: &Application) {
         haptics: None,
     };
 
-    // ── Initial state: NeedsLogin, with whatever account (if any) is
-    // already cached from a previous run determining whether Play
-    // Offline shows a real cached name or falls back to the OS username.
+    // ── Initial state ──
+    // A cached account (from a previous Microsoft sign-in or "Play
+    // Offline") skips the Login page entirely: Home renders immediately
+    // from the cached profile (PLAN.md §3), and a cached Microsoft
+    // account additionally kicks off a silent refresh in the background
+    // so the player is never sent through the device-code dance again
+    // just because their MSA token went stale between launches. Only a
+    // genuinely first-ever launch (no cached account at all) lands on
+    // Login.
     {
         let cached = state.lock().unwrap().accounts.active().cloned();
         let display_name = cached
@@ -1300,11 +1410,20 @@ fn build_ui(app: &Application) {
         widgets
             .play_offline_btn
             .set_label(&format!("Play Offline as {display_name}"));
-        let initial = auth::AuthState::NeedsLogin { cached };
-        state.lock().unwrap().auth = initial.clone();
-        render_auth_state(&widgets, &initial);
+
+        let initial = auth_state_for_cached(cached.as_ref());
+        match cached {
+            Some(account) => {
+                go_to_home(&state, &widgets, initial);
+                start_silent_refresh(&state, &widgets, account);
+            }
+            None => {
+                state.lock().unwrap().auth = initial.clone();
+                render_auth_state(&widgets, &initial);
+                widgets.focus_default_for(View::Login);
+            }
+        }
     }
-    widgets.focus_default_for(View::Login);
 
     {
         let state = state.clone();

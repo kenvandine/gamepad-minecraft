@@ -136,6 +136,12 @@ pub enum AuthState {
         verification_uri: String,
         expires_at: Instant,
     },
+    /// The cached MSA refresh token was just confirmed still valid (one
+    /// cheap token-endpoint call) but the XBL/XSTS/Mojang leg of
+    /// `start_silent_refresh` hasn't completed yet. Purely a transient UI
+    /// state between an optimistic `LoggedIn` and a confirmed one -
+    /// nothing else transitions into or out of it.
+    Verifying { profile: CachedAccount },
     /// Fresh or successfully refreshed online session.
     LoggedIn { profile: McProfile },
     /// Deliberately or forcibly not validating online.
