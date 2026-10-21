@@ -1,0 +1,27 @@
+name: Build snap
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The jre part hardcodes java-25-openjdk-amd64, so only build for amd64.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@v1
+
+      - name: Upload snap
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamepad-minecraft-snap
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: error
