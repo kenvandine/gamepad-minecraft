@@ -423,7 +423,9 @@ pub fn install_instance(
         assets_dir
             .join("indexes")
             .join(format!("{}.json", client_manifest.asset_index.id)),
-        serde_json::to_string(&asset_index.objects).unwrap_or_default(),
+        // The game reads `{"objects": {...}}`; a bare map parses as an
+        // empty index and every sound/language file goes missing.
+        serde_json::json!({ "objects": &asset_index.objects }).to_string(),
     )
     .map_err(|e| HttpError(e.to_string()))?;
     for object in asset_index.objects.values() {
