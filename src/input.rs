@@ -23,8 +23,13 @@ use gilrs::Button;
 pub enum GamepadAction {
     Confirm,
     Back,
+    /// Opens the account-switcher dropdown.
     OpenAccounts,
-    RefreshOrSettings,
+    /// Opens the installation (version) dropdown.
+    OpenVersions,
+    /// Shoulder buttons: switch between the Play and Installations tabs.
+    PrevTab,
+    NextTab,
     SystemMenu,
 }
 
@@ -41,7 +46,9 @@ pub fn classify_button(button: Button) -> Option<GamepadAction> {
         Button::South | Button::Start => Some(GamepadAction::Confirm),
         Button::East | Button::Select => Some(GamepadAction::Back),
         Button::West => Some(GamepadAction::OpenAccounts),
-        Button::North => Some(GamepadAction::RefreshOrSettings),
+        Button::North => Some(GamepadAction::OpenVersions),
+        Button::LeftTrigger => Some(GamepadAction::PrevTab),
+        Button::RightTrigger => Some(GamepadAction::NextTab),
         Button::Mode => Some(GamepadAction::SystemMenu),
         _ => None,
     }
@@ -59,6 +66,12 @@ mod tests {
     #[test]
     fn east_is_back() {
         assert_eq!(classify_button(Button::East), Some(GamepadAction::Back));
+    }
+
+    #[test]
+    fn shoulders_switch_tabs() {
+        assert_eq!(classify_button(Button::LeftTrigger), Some(GamepadAction::PrevTab));
+        assert_eq!(classify_button(Button::RightTrigger), Some(GamepadAction::NextTab));
     }
 
     #[test]

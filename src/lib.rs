@@ -18,4 +18,5 @@ pub mod instance;
 pub mod launch;
 pub mod net;
 pub mod paths;
+pub mod pixelart;
 pub mod qr;

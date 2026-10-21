@@ -27,11 +27,12 @@ Flat `src/`, one binary crate, no workspace — same shape as gamepad-2048:
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | Window/CSS setup, `gtk::Stack` pages, `View` enum, `AppData`/`Widgets`, keyboard input, the `gilrs` poll loop, `handle_gp_navigate/confirm/back` dispatch. |
+| `main.rs` | Window/CSS setup (`style.css`), `gtk::Stack` pages, `View`/`HomeTab`/`Dropdown` enums, `AppData`/`Widgets`, keyboard input, the `gilrs` poll loop, `navigate`/`handle_gp_confirm`/`handle_gp_back` dispatch. |
 | `input.rs` | The **only** gamepad button→action mapping table (`classify_button`). gamepad-2048 shipped a second, unused copy of this in its own `gamepad.rs` while `main.rs` reimplemented the mapping inline — `input.rs` is designed so that mistake can't happen here: nothing matches on `gilrs::Button` except this one function. |
 | `net.rs` | Background-thread + `async-channel` bridge to the GTK main loop (`spawn_blocking`), plus thin `reqwest::blocking` helpers (`get_json`, `post_form`, `download_to_file`). No GTK dependency. |
 | `auth.rs` | RFC 8628 device-code flow, MSA → XBL → XSTS → Mojang token exchange, the `AuthState`/`AuthEvent` state machine (online login vs. cached offline play — see §3). HTTP calls delegate to `net.rs`; the state machine itself is unit-testable in isolation, same as gamepad-2048's `game.rs`. |
 | `account.rs` | Cached-account JSON store (`$SNAP_USER_COMMON/gamepad-minecraft/accounts.json`), structured identically to gamepad-2048's `scores.rs`: silent empty-default on a missing/corrupt file, never panics. |
+| `pixelart.rs` | GTK-free pixel renderers in the same spirit as `qr.rs`: the blocky bitmap font used for the PLAY button (and the logo's "JAVA EDITION" line), and the per-account 8x8 pixel-face avatars derived from each account's UUID - no skin download, so they work offline. |
 | `qr.rs` | Renders the device-code verification URI into an RGBA pixel buffer using the `qrcode` crate directly — no external `qrencode` binary, no `image` crate. `main.rs` wraps the buffer in a `gdk::MemoryTexture`. |
 | `instance.rs` | Mojang version-manifest fetch, the installed-instance list (multiple versions side by side, switchable — see §5), download/verify orchestration. Persisted the same way as `account.rs`/`scores.rs`. |
 | `fabric.rs` | Fabric Loader install and Controlify mod auto-injection into a new instance's `mods/`, so Minecraft's own title screen is gamepad-navigable too. |
@@ -98,25 +99,35 @@ a scan that may never happen.
 
 ## 4. Theme
 
-Reused exactly from gamepad-shell / gamepad-2048's "Resolute Raccoon"
-palette — hand-copied as CSS-in-Rust in `main.rs`, since no shared theme
-crate exists across the gamepad-* family:
+Modelled on the official Minecraft Launcher rather than the gamepad-*
+family's "Resolute Raccoon" palette (an earlier version of this plan
+reused that; it was dropped in favour of a look Minecraft players
+already recognise). The stylesheet lives in `src/style.css`, embedded
+with `include_str!`:
 
-```css
-@define-color orange         #E95420;  /* primary accent, focus highlight */
-@define-color orange_bright  #F4703C;  /* hover/focus border, headings */
-@define-color aubergine      #2C001E;  /* deep background */
-@define-color purple         #77216F;  /* supporting accent */
-```
+- Charcoal bars (`#262626` top, `#313233` bottom) around a full-bleed
+  hero image, with "MINECRAFT: JAVA EDITION" and **Play** /
+  **Installations** tabs in the top bar (the active tab gets a short
+  green underline).
+- Softly rounded controls and panels (8-20px radii, translucent
+  edges rather than hard black outlines). The big PLAY button is a
+  `#3c8527` green gradient with a gentle darker lip along its bottom
+  edge and a drop shadow, straddling the hero and the bottom bar; its
+  label is drawn in the pixel font from `pixelart.rs`.
+- A light-green notice banner (`#84d65a`) in the hero's corner for
+  install progress and launch/install outcomes.
+- Focus is a bold 3px white outline on everything focusable - a
+  controller (or a finger) is the only pointer, so the highlighted
+  control must be unmistakable.
 
-Backgrounds: near-black aubergine `#150610`; card/button surfaces
-`#3A1A28` (default) / `#4A2550` (hover); focused/active widgets get an
-orange fill, an `orange_bright` border, and a soft glow
-(`box-shadow: 0 0 0 3px alpha(orange, 0.35)`). Text is `#FFFFFF`, with
-`alpha(#FFFFFF, 0.40–0.62)` for secondary/hint copy. Font: `"Ubuntu Sans",
-"Ubuntu", sans-serif`. The window launches fullscreen
-(`window.fullscreen()` after `present()`) since this targets a handheld
-screen, not a resizable desktop window.
+All artwork - the Nether wastes key art, the stone "MINECRAFT / JAVA
+EDITION" wordmark and the grass-block icon - is original and rendered by
+`examples/gen_art.rs` (a small voxel ray tracer with procedural 16x16
+block textures). No Mojang artwork, fonts or textures are bundled; the
+generated PNGs in `data/art/` are embedded with `include_bytes!`.
+
+The window launches fullscreen (`window.fullscreen()` after `present()`)
+since this targets a handheld screen, not a resizable desktop window.
 
 ## 5. Screens and gamepad UX
 
@@ -124,18 +135,26 @@ screen, not a resizable desktop window.
 
 | Page | Default focus | A / Confirm | B / Back |
 |---|---|---|---|
-| `Login` | "Sign in" (only reached when no account has ever been cached) | Activates focused widget | Cancels device-code polling if active, else quits |
-| `Home` | First instance tile, or "Add Instance" if none exist | Launch focused instance | Quit-confirm overlay |
-| `InstanceDetail` | "Play" | Play / Update / Delete per focused button | Back to `Home`, refocusing the tile just left |
-| `Accounts` (X) | Active account row | Switch active account | Back to `Home` |
-| `Settings` (Y) | First setting control | Toggle/activate | Back to `Home` |
-| `Launching` (overlay over `Home`) | "Cancel" | n/a during progress | Cancels the job, hides the overlay |
+| `Login` | "Sign in" (reached on first launch, or via "Add a Microsoft account") | Activates focused widget | Cancels device-code polling if active, else back to `Home` if an account exists, else quits |
+| `Home` › Play tab | PLAY | Activates focused widget | Quit-confirm overlay (TODO) |
+| `Home` › Installations tab | First installation's Play button | Activates focused widget | Back to the Play tab |
+| `Home` › account dropdown (X) | Active account | Switch account / add one | Closes the dropdown |
+| `Home` › version dropdown (Y) | Selected installation | Select it / new installation | Closes the dropdown |
+| `VersionPicker` ("New installation") | Newest supported release | Install it | Back to `Home` |
 
-`Home`'s instance grid supports **multiple installed Minecraft versions
-side by side** — each tile is a separately downloaded, separately updatable
-instance (`instance.rs`), and `InstanceDetail` is where a new version gets
-added by browsing Mojang's version manifest online. Switching versions is
-just navigating to a different tile; nothing is a single hardcoded version.
+`Home` supports **multiple installed Minecraft versions side by side** —
+each installation is a separately downloaded instance (`instance.rs`).
+The bottom-left dropdown picks which one PLAY launches (remembered in
+`instances.json` as `selected`); the Installations tab lists them all
+with per-row Play and Delete buttons (Delete needs a second press to
+confirm), and "New installation" opens the version picker, which browses
+Mojang's version manifest online.
+
+The dropdowns are drawn in-window over a dimming scrim rather than as
+`gtk::Popover`s: a popover is a separate surface, so its items would sit
+outside the focus walk and D-Pad navigation could escape it. While one
+is open it is modal - Up/Down move only within it, and tapping the scrim
+closes it.
 
 Face-button scheme (both Legion Go S and MSI Claw are Xbox-style ABXY
 pads, so South = A = confirm and East = B = back is the correct convention
@@ -143,8 +162,9 @@ here — documented as a deliberate choice in `input.rs`, not an oversight):
 
 - **A / South:** Select / Confirm / Launch
 - **B / East:** Back / Cancel
-- **X / West:** Accounts — switch signed-in user
-- **Y / North:** Refresh instances / Settings
+- **X / West:** Account switcher dropdown
+- **Y / North:** Installation (version) dropdown
+- **LB / RB:** Switch between the Play and Installations tabs
 - **Start:** System / power overlay
 
 gamepad-2048's `docs/UX_REVIEW.md` found two bug classes after its initial
@@ -164,10 +184,12 @@ later:
 3. All "back" gestures (gamepad B, keyboard Escape) funnel through one
    `handle_gp_back()` so the `View` enum and the visible `Stack` page can
    never desync.
-4. Custom horizontal button rows (Login's two buttons, InstanceDetail's
-   Play/Update/Delete row, the instance grid) use manual index-stepping for
-   Left/Right rather than trusting GTK's geometric `child_focus()` search,
-   which skipped neighbors in gamepad-2048's own board-size row.
+4. Navigation never trusts GTK's geometric `child_focus()` search, which
+   skipped neighbors in gamepad-2048's own board-size row. Single-column
+   pages step through widgets in document order; `Home`, which is laid
+   out in two dimensions (top bar, bottom bar, installation rows with
+   their own buttons), uses an explicit row/column grid
+   (`home_nav_rows` + `grid_step` in `main.rs`).
 5. Every screen carries an on-screen button-hint legend (e.g. "A: Sign In
    • B: Play Offline / Quit") — there's no keyboard in view, so nothing is
    gated on the player already knowing a control exists.

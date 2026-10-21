@@ -8,12 +8,15 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
 
-use gamepad_minecraft::{account, audio, auth, fabric, haptics, input, instance, launch, net, qr};
+use gamepad_minecraft::{
+    account, audio, auth, fabric, haptics, input, instance, launch, net, pixelart, qr,
+};
 
 use account::{AccountStore, CachedAccount};
 use input::GamepadAction;
@@ -26,19 +29,42 @@ enum View {
     Login,
     Home,
     VersionPicker,
-    InstanceDetail,
+}
+
+/// The tabs in Home's top bar, as in the official launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeTab {
+    Play,
+    Installations,
+}
+
+/// Home's two dropdown panels. They're drawn in-window over a dimming
+/// scrim rather than as `gtk::Popover`s: a popover is its own surface,
+/// so its items would sit outside the focus walk in `home_nav_rows` and
+/// D-Pad navigation could escape it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropdown {
     Accounts,
-    Settings,
+    Versions,
 }
 
 struct AppData {
     view: View,
+    home_tab: HomeTab,
+    dropdown: Option<Dropdown>,
     accounts: AccountStore,
     instances: InstanceStore,
     auth: auth::AuthState,
     /// Set while a device-code poll thread is running, so Back can
     /// cancel it instead of leaving it to poll Microsoft until expiry.
     poll_cancel: Option<Arc<AtomicBool>>,
+    /// An installation whose Delete button has been pressed once and is
+    /// waiting for a second press to confirm - throwing away several GB
+    /// of downloads shouldn't be one stray A press away.
+    pending_delete: Option<String>,
+    /// Bumped by every `show_notice`, so an older notice's auto-hide
+    /// timer can tell it's been superseded and leave the new one up.
+    notice_serial: u64,
     /// True from the moment a launch is kicked off until Minecraft's
     /// process exits. `gilrs` reads the gamepad's raw evdev device
     /// directly, completely bypassing the compositor's window-focus
@@ -72,19 +98,41 @@ struct Widgets {
     user_code_label: gtk::Label,
     sign_in_btn: gtk::Button,
     play_offline_btn: gtk::Button,
-    // Home page
-    home_status_label: gtk::Label,
-    instance_list: gtk::Box,
-    add_instance_btn: gtk::Button,
+    login_back_btn: gtk::Button,
+    // Home: top bar
+    top_bar: gtk::Box,
+    account_btn: gtk::Button,
+    account_avatar: gtk::Image,
+    account_name_label: gtk::Label,
+    account_kind_label: gtk::Label,
+    tab_play_btn: gtk::Button,
+    tab_installs_btn: gtk::Button,
+    home_hint: gtk::Label,
+    // Home: tab content
+    home_tabs: gtk::Stack,
+    new_install_btn: gtk::Button,
+    installs_list: gtk::Box,
+    // Home: bottom bar
+    bottom_bar: gtk::CenterBox,
+    version_btn: gtk::Button,
+    version_title_label: gtk::Label,
+    version_subtitle_label: gtk::Label,
+    play_btn: gtk::Button,
+    play_label: gtk::Picture,
+    bottom_account_label: gtk::Label,
+    // Home: overlays
+    notice: gtk::Box,
+    notice_label: gtk::Label,
     install_progress: gtk::ProgressBar,
+    scrim: gtk::Box,
+    accounts_panel: gtk::Box,
+    accounts_items: gtk::Box,
+    versions_panel: gtk::Box,
+    versions_items: gtk::Box,
     // Version picker page
     version_status_label: gtk::Label,
     version_list: gtk::Box,
-    // Accounts page
-    accounts_list: gtk::Box,
-    add_account_btn: gtk::Button,
-    // Settings page
-    settings_list: gtk::Box,
+    grass_icon: gdk::Texture,
     sound: audio::Player,
     haptics: Option<haptics::Haptics>,
 }
@@ -93,21 +141,36 @@ impl Widgets {
     /// Seeds keyboard/gamepad focus for `view`. Every screen transition
     /// must call this — a revealer/page swap without a refocus call was
     /// gamepad-2048's single biggest bug class (PLAN.md §5, lesson 2).
+    /// Home's sub-state (open dropdown, active tab) is read back from
+    /// the widgets themselves so this never needs `AppData`.
     fn focus_default_for(&self, view: View) {
         self.stack.set_visible_child_name(view_name(view));
         match view {
             View::Login => {
-                if self.sign_in_btn.get_sensitive() {
+                if self.sign_in_btn.is_visible() && self.sign_in_btn.is_sensitive() {
                     self.sign_in_btn.grab_focus();
                 } else {
                     self.play_offline_btn.grab_focus();
                 }
             }
             View::Home => {
-                if let Some(first) = self.instance_list.first_child() {
-                    first.grab_focus();
+                if self.accounts_panel.is_visible() {
+                    focus_current_item(self.accounts_panel.upcast_ref());
+                } else if self.versions_panel.is_visible() {
+                    focus_current_item(self.versions_panel.upcast_ref());
+                } else if self.home_tabs.visible_child_name().as_deref() == Some("installations") {
+                    let first_row = self
+                        .installs_list
+                        .first_child()
+                        .and_then(|row| focusables(&row).into_iter().next());
+                    match first_row {
+                        Some(btn) => btn.grab_focus(),
+                        None => self.new_install_btn.grab_focus(),
+                    };
+                } else if self.play_btn.is_sensitive() {
+                    self.play_btn.grab_focus();
                 } else {
-                    self.add_instance_btn.grab_focus();
+                    self.version_btn.grab_focus();
                 }
             }
             View::VersionPicker => {
@@ -115,28 +178,8 @@ impl Widgets {
                     first.grab_focus();
                 }
             }
-            View::Accounts => {
-                if let Some(first) = self.accounts_list.first_child() {
-                    first.grab_focus();
-                } else {
-                    self.add_account_btn.grab_focus();
-                }
-            }
-            View::Settings => {
-                if let Some(first) = self.settings_list.first_child() {
-                    first.grab_focus();
-                }
-            }
-            _ => {}
         }
     }
-}
-
-/// X (Accounts) and Y (Settings) are Home-level shortcuts (PLAN.md §5's
-/// face-button scheme) - guarding on this avoids e.g. X popping open
-/// Accounts mid-QR-code sign-in.
-fn is_on_home(state: &Arc<Mutex<AppData>>) -> bool {
-    state.lock().unwrap().view == View::Home
 }
 
 fn view_name(view: View) -> &'static str {
@@ -144,24 +187,187 @@ fn view_name(view: View) -> &'static str {
         View::Login => "login",
         View::Home => "home",
         View::VersionPicker => "version-picker",
-        View::InstanceDetail => "instance-detail",
-        View::Accounts => "accounts",
-        View::Settings => "settings",
     }
 }
 
+/// The Home-level shortcuts (X, Y, shoulder buttons) only apply on
+/// Home - guarding on this avoids e.g. X popping open the account
+/// switcher mid-QR-code sign-in.
+fn is_on_home(state: &Arc<Mutex<AppData>>) -> bool {
+    state.lock().unwrap().view == View::Home
+}
+
+// ─── Small widget helpers ──────────────────────────────────────────
+
+fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
+}
+
+fn label(text: &str, classes: &[&str]) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_css_classes(classes);
+    label.set_xalign(0.0);
+    label
+}
+
+/// Every visible, sensitive button inside `root`, in document order.
+/// Buttons are the only things this UI ever focuses.
+fn focusables(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        if !widget.is_visible() {
+            return;
+        }
+        if widget.is::<gtk::Button>() {
+            if widget.is_sensitive() {
+                out.push(widget.clone());
+            }
+            return;
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            walk(&c, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
+/// Focuses the dropdown item marked `.current`, else the first item.
+fn focus_current_item(panel: &gtk::Widget) {
+    let items = focusables(panel);
+    let current = items.iter().find(|w| w.has_css_class("current"));
+    if let Some(item) = current.or(items.first()) {
+        item.grab_focus();
+    }
+}
+
+fn texture_from_image(image: &pixelart::Image) -> gdk::MemoryTexture {
+    gdk::MemoryTexture::new(
+        image.width as i32,
+        image.height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from(image.rgba.as_slice()),
+        (image.width * 4) as usize,
+    )
+}
+
+/// Renders a QR code straight to a GPU-uploadable texture - no temp
+/// files, no external image crate (see `qr.rs`).
+fn qr_texture(image: &qr::QrImage) -> gdk::MemoryTexture {
+    let bytes = glib::Bytes::from(image.rgba.as_slice());
+    let stride = (image.width * 4) as usize;
+    gdk::MemoryTexture::new(
+        image.width as i32,
+        image.height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        stride,
+    )
+}
+
+/// The PLAY button's label, drawn in the blocky pixel font (see
+/// `pixelart.rs`) rather than a system font.
+fn play_label_texture(text: &str) -> gdk::MemoryTexture {
+    texture_from_image(&pixelart::render_text(
+        text,
+        4,
+        [0xFF, 0xFF, 0xFF, 0xFF],
+        [0x2B, 0x2B, 0x2B, 0xFF],
+    ))
+}
+
+fn avatar_texture(seed: &str, size: i32) -> gdk::MemoryTexture {
+    texture_from_image(&pixelart::render_avatar(seed, (size as u32 / 12).max(2)))
+}
+
+/// A circular avatar, clipped by its `.avatar` frame.
+fn avatar_widget(seed: &str, size: i32) -> gtk::Widget {
+    let image = gtk::Image::from_paintable(Some(&avatar_texture(seed, size)));
+    image.set_pixel_size(size);
+    let frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    frame.add_css_class("avatar");
+    frame.set_overflow(gtk::Overflow::Hidden);
+    frame.set_valign(gtk::Align::Center);
+    frame.append(&image);
+    frame.upcast()
+}
+
+/// One row of a dropdown panel: icon, title, subtitle, and a check
+/// mark on the current choice.
+fn dropdown_item(icon: &gtk::Widget, title: &str, subtitle: &str, current: bool) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.set_css_classes(&["flat-mc", "dropdown-item"]);
+    set_class(&btn, "current", current);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.append(icon);
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    text.set_valign(gtk::Align::Center);
+    text.append(&label(title, &["item-title"]));
+    text.append(&label(subtitle, &["item-subtitle"]));
+    row.append(&text);
+    if current {
+        let check = gtk::Label::new(Some("✓"));
+        check.add_css_class("check");
+        row.append(&check);
+    }
+    btn.set_child(Some(&row));
+    btn
+}
+
+fn grass_image(widgets: &Widgets, size: i32) -> gtk::Widget {
+    let image = gtk::Image::from_paintable(Some(&widgets.grass_icon));
+    image.set_pixel_size(size);
+    image.upcast()
+}
+
+fn icon_image(name: &str, size: i32) -> gtk::Widget {
+    let image = gtk::Image::from_icon_name(name);
+    image.set_pixel_size(size);
+    image.upcast()
+}
+
+/// "Latest release" for the newest installed version, like the
+/// official launcher's default profile name; "Release" otherwise.
+fn installation_title(store: &InstanceStore, meta: &InstanceMeta) -> String {
+    let newest = store.newest_installed().is_some_and(|n| n.id == meta.id);
+    if newest { "Latest release" } else { "Release" }.to_string()
+}
+
+fn installation_subtitle(meta: &InstanceMeta) -> String {
+    let loader = match meta.loader {
+        instance::Loader::Fabric => "Fabric + Controlify",
+        instance::Loader::Vanilla => "Vanilla",
+    };
+    match meta.state {
+        InstallState::Installed => format!("{}  ·  {loader}", meta.mc_version),
+        InstallState::Downloading => format!("{}  ·  Installing…", meta.mc_version),
+        InstallState::Failed => format!("{}  ·  Install failed", meta.mc_version),
+        InstallState::NotInstalled => format!("{}  ·  Not installed", meta.mc_version),
+    }
+}
+
+// ─── Auth state rendering ──────────────────────────────────────────
+
 /// Applies `auth` to every widget that reflects sign-in state. This is
-/// the single place that decides what the Login/Home screens show for a
-/// given `AuthState`, so there is exactly one source of truth instead of
-/// call sites disagreeing about what a given state looks like.
+/// the single place that decides what the Login page and Home's account
+/// displays show for a given `AuthState`, so there is exactly one source
+/// of truth instead of call sites disagreeing about what a given state
+/// looks like.
 fn render_auth_state(widgets: &Widgets, auth: &auth::AuthState) {
     match auth {
         auth::AuthState::Resolving => {
             widgets.login_status_label.set_label("Loading...");
             widgets.qr_picture.set_visible(false);
             widgets.user_code_label.set_visible(false);
+            widgets.sign_in_btn.set_visible(true);
             widgets.sign_in_btn.set_sensitive(true);
-            widgets.sign_in_btn.set_label("Sign in with Microsoft");
         }
         auth::AuthState::NeedsLogin { .. } => {
             widgets
@@ -169,8 +375,8 @@ fn render_auth_state(widgets: &Widgets, auth: &auth::AuthState) {
                 .set_label("Sign in to play online, or play offline.");
             widgets.qr_picture.set_visible(false);
             widgets.user_code_label.set_visible(false);
+            widgets.sign_in_btn.set_visible(true);
             widgets.sign_in_btn.set_sensitive(true);
-            widgets.sign_in_btn.set_label("Sign in with Microsoft");
         }
         auth::AuthState::AwaitingUser {
             user_code,
@@ -179,57 +385,54 @@ fn render_auth_state(widgets: &Widgets, auth: &auth::AuthState) {
             ..
         } => {
             widgets.login_status_label.set_label(&format!(
-                "Go to {verification_uri} and enter the code below, or scan it."
+                "Scan the code with your phone, or go to {verification_uri} and enter:"
             ));
             widgets.user_code_label.set_label(user_code);
             widgets.user_code_label.set_visible(true);
-            match qr::render_verification_qr(qr_data, 8) {
+            match qr::render_verification_qr(qr_data, 6) {
                 Ok(image) => {
                     widgets.qr_picture.set_paintable(Some(&qr_texture(&image)));
                     widgets.qr_picture.set_visible(true);
                 }
                 Err(_) => widgets.qr_picture.set_visible(false),
             }
-            widgets.sign_in_btn.set_sensitive(false);
-            widgets.sign_in_btn.set_label("Waiting for approval...");
+            // Nothing to press while waiting - the status text says
+            // what's happening, and hiding it keeps the card short
+            // enough for a 800px-tall handheld screen.
+            widgets.sign_in_btn.set_visible(false);
         }
         auth::AuthState::Verifying { profile } => {
-            widgets
-                .home_status_label
-                .set_label(&format!("Signed in as {} - verifying...", profile.username));
+            render_identity(widgets, &profile.username, &profile.uuid, "Verifying…");
         }
         auth::AuthState::LoggedIn { profile } => {
-            widgets
-                .home_status_label
-                .set_label(&format!("Signed in as {}", profile.name));
+            render_identity(widgets, &profile.name, &profile.id, "Microsoft account");
         }
         auth::AuthState::OfflinePlaying { profile } => {
-            widgets
-                .home_status_label
-                .set_label(&format!("Offline mode - playing as {}", profile.username));
+            let kind = if profile.refresh_token.is_some() {
+                "Microsoft account · offline"
+            } else {
+                "Offline account"
+            };
+            render_identity(widgets, &profile.username, &profile.uuid, kind);
         }
         auth::AuthState::Error { message, .. } => {
             widgets.login_status_label.set_label(message);
             widgets.qr_picture.set_visible(false);
             widgets.user_code_label.set_visible(false);
+            widgets.sign_in_btn.set_visible(true);
             widgets.sign_in_btn.set_sensitive(true);
-            widgets.sign_in_btn.set_label("Sign in with Microsoft");
         }
     }
 }
 
-/// Renders a QR code straight to a GPU-uploadable texture - no temp
-/// files, no external image crate (see `qr.rs`).
-fn qr_texture(image: &qr::QrImage) -> gtk::gdk::MemoryTexture {
-    let bytes = glib::Bytes::from(image.rgba.as_slice());
-    let stride = (image.width * 4) as usize;
-    gtk::gdk::MemoryTexture::new(
-        image.width as i32,
-        image.height as i32,
-        gtk::gdk::MemoryFormat::R8g8b8a8,
-        &bytes,
-        stride,
-    )
+/// The account switcher (top left) and the name in the bottom bar.
+fn render_identity(widgets: &Widgets, name: &str, uuid: &str, kind: &str) {
+    widgets.account_name_label.set_label(name);
+    widgets.account_kind_label.set_label(kind);
+    widgets
+        .account_avatar
+        .set_paintable(Some(&avatar_texture(uuid, 48)));
+    widgets.bottom_account_label.set_label(name);
 }
 
 // ─── Login flow ─────────────────────────────────────────────────────
@@ -269,7 +472,7 @@ fn start_sign_in(state: Arc<Mutex<AppData>>, widgets: Widgets) {
                 + std::time::Duration::from_secs(device.expires_in),
         };
         update_login_state(&state1, &widgets1, awaiting);
-        widgets1.play_offline_btn.grab_focus();
+        widgets1.focus_default_for(View::Login);
 
         let state2 = state1.clone();
         let widgets2 = widgets1.clone();
@@ -355,8 +558,22 @@ fn go_to_home(state: &Arc<Mutex<AppData>>, widgets: &Widgets, new_auth: auth::Au
         data.view = View::Home;
     }
     render_auth_state(widgets, &new_auth);
-    refresh_instance_grid(state, widgets);
+    refresh_home(state, widgets);
     widgets.focus_default_for(View::Home);
+}
+
+/// Leaves the Login page for Home without signing in - only possible
+/// when some account is already cached (i.e. the player came here via
+/// "Add a Microsoft account"), and cancels any device-code polling.
+fn return_home_from_login(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let cached = {
+        let mut data = state.lock().unwrap();
+        if let Some(cancel) = data.poll_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        data.accounts.active().cloned()
+    };
+    go_to_home(state, widgets, auth_state_for_cached(cached.as_ref()));
 }
 
 /// The offline path: no network, no Mojang account required at all.
@@ -390,44 +607,440 @@ fn start_play_offline(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     go_to_home(state, widgets, auth::AuthState::OfflinePlaying { profile });
 }
 
-// ─── Instance management & launch ──────────────────────────────────
-// Rebuilds the Home page's instance tiles from `AppData.instances`.
-// Called after every state change that affects the list (install
-// started/finished, launch finished) rather than mutating tiles in
-// place, since the list length itself changes on "Add Instance".
-fn refresh_instance_grid(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
-    while let Some(child) = widgets.instance_list.first_child() {
-        widgets.instance_list.remove(&child);
+// ─── Home: tabs, bottom bar, installations ─────────────────────────
+
+const HINT_PLAY: &str = "A Play  ·  X Accounts  ·  Y Versions  ·  LB/RB Tabs";
+const HINT_INSTALLS: &str = "A Select  ·  B Back  ·  LB/RB Tabs";
+
+fn set_home_tab(state: &Arc<Mutex<AppData>>, widgets: &Widgets, tab: HomeTab) {
+    {
+        let mut data = state.lock().unwrap();
+        data.home_tab = tab;
+        data.pending_delete = None;
     }
+    let play = tab == HomeTab::Play;
+    widgets
+        .home_tabs
+        .set_visible_child_name(if play { "play" } else { "installations" });
+    set_class(&widgets.tab_play_btn, "active", play);
+    set_class(&widgets.tab_installs_btn, "active", !play);
+    widgets.bottom_bar.set_visible(play);
+    widgets.play_btn.set_visible(play);
+    widgets
+        .home_hint
+        .set_label(if play { HINT_PLAY } else { HINT_INSTALLS });
+    refresh_home(state, widgets);
+    widgets.focus_default_for(View::Home);
+}
 
-    let instances = state.lock().unwrap().instances.instances.clone();
-    for meta in instances {
-        let loader_tag = match meta.loader {
-            instance::Loader::Fabric => "Fabric",
-            instance::Loader::Vanilla => "Vanilla",
-        };
-        let label = match meta.state {
-            InstallState::Installed => format!("Play {} ({loader_tag})", meta.mc_version),
-            InstallState::Downloading => format!("{} — installing...", meta.mc_version),
-            InstallState::Failed => format!("{} — install failed, select to retry", meta.mc_version),
-            InstallState::NotInstalled => format!("{} — not installed", meta.mc_version),
-        };
-        let btn = gtk::Button::with_label(&label);
-        btn.set_css_classes(&["action-button"]);
-        btn.set_sensitive(!matches!(meta.state, InstallState::Downloading));
-
-        let state_for_btn = state.clone();
-        let widgets_for_btn = widgets.clone();
-        let meta_for_btn = meta.clone();
-        btn.connect_clicked(move |_| match meta_for_btn.state {
-            InstallState::Installed => {
-                start_launch_instance(&state_for_btn, &widgets_for_btn, meta_for_btn.clone())
-            }
-            _ => start_install(state_for_btn.clone(), widgets_for_btn.clone(), meta_for_btn.clone()),
-        });
-        widgets.instance_list.append(&btn);
+fn other_tab(tab: HomeTab) -> HomeTab {
+    match tab {
+        HomeTab::Play => HomeTab::Installations,
+        HomeTab::Installations => HomeTab::Play,
     }
 }
+
+/// Re-renders everything on Home that depends on the installation list
+/// or launch state: the version selector, the PLAY button, and (when
+/// visible) the Installations tab. Called after every state change that
+/// affects them, rather than patching individual widgets in place.
+fn refresh_home(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let (store, running, tab) = {
+        let data = state.lock().unwrap();
+        (data.instances.clone(), data.minecraft_running, data.home_tab)
+    };
+    let selected = store.selected().cloned();
+
+    match &selected {
+        Some(meta) => {
+            widgets
+                .version_title_label
+                .set_label(&installation_title(&store, meta));
+            widgets
+                .version_subtitle_label
+                .set_label(&installation_subtitle(meta));
+        }
+        None => {
+            widgets.version_title_label.set_label("No installations");
+            widgets
+                .version_subtitle_label
+                .set_label("Add one to start playing");
+        }
+    }
+
+    let (text, sensitive) = if running {
+        ("PLAYING", false)
+    } else {
+        match selected.map(|m| m.state) {
+            None | Some(InstallState::NotInstalled) => ("INSTALL", true),
+            Some(InstallState::Installed) => ("PLAY", true),
+            Some(InstallState::Downloading) => ("INSTALLING", false),
+            Some(InstallState::Failed) => ("RETRY", true),
+        }
+    };
+    widgets.play_label.set_paintable(Some(&play_label_texture(text)));
+    let had_focus = widgets.play_btn.has_focus();
+    widgets.play_btn.set_sensitive(sensitive);
+    if had_focus && !sensitive {
+        // An insensitive widget can't hold focus; don't leave the
+        // controller with nothing highlighted.
+        widgets.version_btn.grab_focus();
+    }
+
+    if tab == HomeTab::Installations {
+        refresh_installations(state, widgets);
+    }
+}
+
+/// Where focus sits inside `container`'s rows, as (row, column), so a
+/// rebuild of those rows can put it back in the same place.
+fn focus_position_in(container: &gtk::Box, window: &ApplicationWindow) -> Option<(usize, usize)> {
+    let focused = gtk::prelude::RootExt::focus(window)?;
+    let mut row = container.first_child();
+    let mut r = 0;
+    while let Some(w) = row {
+        if let Some(c) = focusables(&w).iter().position(|f| f == &focused) {
+            return Some((r, c));
+        }
+        r += 1;
+        row = w.next_sibling();
+    }
+    None
+}
+
+fn refresh_installations(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let restore = focus_position_in(&widgets.installs_list, &widgets.window);
+    while let Some(child) = widgets.installs_list.first_child() {
+        widgets.installs_list.remove(&child);
+    }
+
+    let (store, pending_delete, running) = {
+        let data = state.lock().unwrap();
+        (data.instances.clone(), data.pending_delete.clone(), data.minecraft_running)
+    };
+    if store.instances.is_empty() {
+        let empty = label(
+            "No installations yet. Choose \"New installation\" to download a Minecraft version.",
+            &["item-subtitle"],
+        );
+        empty.set_wrap(true);
+        widgets.installs_list.append(&empty);
+    }
+
+    let selected_id = store.selected().map(|m| m.id.clone());
+    let mut metas = store.instances.clone();
+    metas.sort_by(|a, b| instance::compare_versions(&b.mc_version, &a.mc_version));
+    for meta in metas {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        row.add_css_class("install-row");
+        set_class(&row, "current", selected_id.as_deref() == Some(meta.id.as_str()));
+        row.append(&grass_image(widgets, 48));
+
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        text.set_valign(gtk::Align::Center);
+        text.append(&label(&installation_title(&store, &meta), &["item-title"]));
+        text.append(&label(&installation_subtitle(&meta), &["item-subtitle"]));
+        row.append(&text);
+
+        let play_text = match meta.state {
+            InstallState::Installed => "Play",
+            InstallState::Downloading => "Installing…",
+            InstallState::Failed => "Retry",
+            InstallState::NotInstalled => "Install",
+        };
+        let play = gtk::Button::with_label(play_text);
+        play.set_css_classes(&["flat-mc", "mc-button", "green"]);
+        play.set_valign(gtk::Align::Center);
+        play.set_sensitive(!running && meta.state != InstallState::Downloading);
+        {
+            let (state, widgets, id) = (state.clone(), widgets.clone(), meta.id.clone());
+            play.connect_clicked(move |_| {
+                select_installation(&state, &id);
+                play_selected(&state, &widgets);
+            });
+        }
+        row.append(&play);
+
+        let confirming = pending_delete.as_deref() == Some(meta.id.as_str());
+        let delete = gtk::Button::with_label(if confirming { "Confirm delete" } else { "Delete" });
+        delete.set_css_classes(&["flat-mc", "mc-button"]);
+        set_class(&delete, "danger", confirming);
+        delete.set_valign(gtk::Align::Center);
+        delete.set_sensitive(meta.state != InstallState::Downloading);
+        {
+            let (state, widgets, id) = (state.clone(), widgets.clone(), meta.id.clone());
+            delete.connect_clicked(move |_| delete_installation(&state, &widgets, id.clone()));
+        }
+        row.append(&delete);
+        widgets.installs_list.append(&row);
+    }
+
+    if let Some((r, c)) = restore {
+        let rows: Vec<Vec<gtk::Widget>> = {
+            let mut rows = Vec::new();
+            let mut child = widgets.installs_list.first_child();
+            while let Some(w) = child {
+                rows.push(focusables(&w));
+                child = w.next_sibling();
+            }
+            rows
+        };
+        let target = rows
+            .get(r.min(rows.len().saturating_sub(1)))
+            .and_then(|row| row.get(c.min(row.len().saturating_sub(1))).or(row.first()));
+        match target {
+            Some(w) => w.grab_focus(),
+            None => widgets.new_install_btn.grab_focus(),
+        };
+    }
+}
+
+fn select_installation(state: &Arc<Mutex<AppData>>, id: &str) {
+    let mut data = state.lock().unwrap();
+    data.instances.selected = Some(id.to_string());
+    let _ = data.instances.save();
+}
+
+/// What the PLAY button does for the selected installation: launch it,
+/// (re)try installing it, or - with nothing installed yet - go pick a
+/// version.
+fn play_selected(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let selected = state.lock().unwrap().instances.selected().cloned();
+    match selected {
+        None => open_version_picker(state.clone(), widgets.clone()),
+        Some(meta) => match meta.state {
+            InstallState::Installed => start_launch_instance(state, widgets, meta),
+            InstallState::Downloading => {}
+            InstallState::Failed | InstallState::NotInstalled => {
+                start_install(state.clone(), widgets.clone(), meta)
+            }
+        },
+    }
+}
+
+/// First press arms the delete (the button turns red and asks to
+/// confirm); a second press on the same installation actually deletes
+/// it, freeing its disk space.
+fn delete_installation(state: &Arc<Mutex<AppData>>, widgets: &Widgets, id: String) {
+    let confirmed = {
+        let mut data = state.lock().unwrap();
+        if data.pending_delete.as_deref() == Some(id.as_str()) {
+            data.pending_delete = None;
+            data.instances.instances.retain(|i| i.id != id);
+            if data.instances.selected.as_deref() == Some(id.as_str()) {
+                data.instances.selected = None;
+            }
+            let _ = data.instances.save();
+            true
+        } else {
+            data.pending_delete = Some(id.clone());
+            false
+        }
+    };
+    if confirmed {
+        let _ = std::fs::remove_dir_all(InstanceStore::instance_dir(&id));
+        show_notice(state, widgets, &format!("Deleted Minecraft {id}."), false);
+    }
+    refresh_home(state, widgets);
+}
+
+// ─── Notices ────────────────────────────────────────────────────────
+// The light-green banner in the hero's corner: install progress and
+// the outcome of installs/launches. Transient ones hide themselves.
+
+const NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn show_notice(state: &Arc<Mutex<AppData>>, widgets: &Widgets, text: &str, progress: bool) {
+    let serial = {
+        let mut data = state.lock().unwrap();
+        data.notice_serial += 1;
+        data.notice_serial
+    };
+    widgets.notice_label.set_label(text);
+    widgets.install_progress.set_visible(progress);
+    widgets.notice.set_visible(true);
+    if !progress {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        glib::timeout_add_local_once(NOTICE_TIMEOUT, move || {
+            if state.lock().unwrap().notice_serial == serial {
+                widgets.notice.set_visible(false);
+            }
+        });
+    }
+}
+
+// ─── Dropdowns ──────────────────────────────────────────────────────
+
+fn open_dropdown(state: &Arc<Mutex<AppData>>, widgets: &Widgets, which: Dropdown) {
+    {
+        let mut data = state.lock().unwrap();
+        if data.view != View::Home {
+            return;
+        }
+        data.dropdown = Some(which);
+    }
+    match which {
+        Dropdown::Accounts => populate_accounts_dropdown(state, widgets),
+        Dropdown::Versions => populate_versions_dropdown(state, widgets),
+    }
+    widgets.scrim.set_visible(true);
+    widgets
+        .accounts_panel
+        .set_visible(which == Dropdown::Accounts);
+    widgets
+        .versions_panel
+        .set_visible(which == Dropdown::Versions);
+    widgets.focus_default_for(View::Home);
+}
+
+/// X/Y and the switcher buttons toggle their dropdown.
+fn toggle_dropdown(state: &Arc<Mutex<AppData>>, widgets: &Widgets, which: Dropdown) {
+    let open = state.lock().unwrap().dropdown;
+    match open {
+        Some(current) if current == which => close_dropdown(state, widgets),
+        Some(_) => {
+            close_dropdown(state, widgets);
+            open_dropdown(state, widgets, which);
+        }
+        None => open_dropdown(state, widgets, which),
+    }
+}
+
+/// Hides any open dropdown and hands focus back to the control that
+/// opened it.
+fn close_dropdown(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    let (which, tab) = {
+        let mut data = state.lock().unwrap();
+        (data.dropdown.take(), data.home_tab)
+    };
+    widgets.scrim.set_visible(false);
+    widgets.accounts_panel.set_visible(false);
+    widgets.versions_panel.set_visible(false);
+    match which {
+        Some(Dropdown::Accounts) => {
+            widgets.account_btn.grab_focus();
+        }
+        Some(Dropdown::Versions) if tab == HomeTab::Play => {
+            widgets.version_btn.grab_focus();
+        }
+        _ => widgets.focus_default_for(View::Home),
+    }
+}
+
+fn clear_box(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+// Switching or adding an account is Home-adjacent, not its own auth
+// flow: switching just re-points AppData.accounts.active_uuid and
+// derives an optimistic AuthState from the cached entry (no network
+// call - matches PLAN.md §3's "Home renders immediately from cache").
+// Adding another Microsoft account reuses the exact same Login-page
+// device-code flow, just entered from here instead of a fresh launch.
+fn populate_accounts_dropdown(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    clear_box(&widgets.accounts_items);
+    let (accounts, active_uuid) = {
+        let data = state.lock().unwrap();
+        (data.accounts.accounts.clone(), data.accounts.active_uuid.clone())
+    };
+    for acc in accounts {
+        let is_active = active_uuid.as_deref() == Some(acc.uuid.as_str());
+        let kind = if acc.refresh_token.is_some() {
+            "Microsoft account"
+        } else {
+            "Offline account"
+        };
+        let item = dropdown_item(&avatar_widget(&acc.uuid, 40), &acc.username, kind, is_active);
+        widgets.accounts_items.append(&item);
+        let (state, widgets, uuid) = (state.clone(), widgets.clone(), acc.uuid.clone());
+        item.connect_clicked(move |_| switch_active_account(&state, &widgets, uuid.clone()));
+    }
+}
+
+fn populate_versions_dropdown(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
+    clear_box(&widgets.versions_items);
+    let store = state.lock().unwrap().instances.clone();
+    let selected_id = store.selected().map(|m| m.id.clone());
+    let mut metas = store.instances.clone();
+    metas.sort_by(|a, b| instance::compare_versions(&b.mc_version, &a.mc_version));
+    if metas.is_empty() {
+        let empty = label("Nothing installed yet.", &["item-subtitle"]);
+        empty.set_margin_start(14);
+        empty.set_margin_top(8);
+        empty.set_margin_bottom(8);
+        widgets.versions_items.append(&empty);
+    }
+    for meta in metas {
+        let item = dropdown_item(
+            &grass_image(widgets, 40),
+            &installation_title(&store, &meta),
+            &installation_subtitle(&meta),
+            selected_id.as_deref() == Some(meta.id.as_str()),
+        );
+        widgets.versions_items.append(&item);
+        let (state, widgets, id) = (state.clone(), widgets.clone(), meta.id.clone());
+        item.connect_clicked(move |_| {
+            select_installation(&state, &id);
+            close_dropdown(&state, &widgets);
+            refresh_home(&state, &widgets);
+        });
+    }
+}
+
+/// Derives an optimistic `AuthState` from a cached account with no
+/// network call: `LoggedIn` if it has a refresh token (upgraded to a
+/// freshly-verified session by a silent refresh shortly after, see
+/// `start_silent_refresh`), `OfflinePlaying` otherwise. `None` means no
+/// account has ever been cached at all.
+fn auth_state_for_cached(account: Option<&CachedAccount>) -> auth::AuthState {
+    match account {
+        Some(account) if account.refresh_token.is_some() => auth::AuthState::LoggedIn {
+            profile: auth::McProfile {
+                id: account.uuid.clone(),
+                name: account.username.clone(),
+            },
+        },
+        Some(account) => auth::AuthState::OfflinePlaying {
+            profile: account.clone(),
+        },
+        None => auth::AuthState::NeedsLogin { cached: None },
+    }
+}
+
+fn switch_active_account(state: &Arc<Mutex<AppData>>, widgets: &Widgets, uuid: String) {
+    let account = {
+        let mut data = state.lock().unwrap();
+        data.accounts.active_uuid = Some(uuid);
+        let _ = data.accounts.save();
+        data.accounts.active().cloned()
+    };
+    close_dropdown(state, widgets);
+    go_to_home(state, widgets, auth_state_for_cached(account.as_ref()));
+    if let Some(account) = account {
+        start_silent_refresh(state, widgets, account);
+    }
+}
+
+/// Opens the same device-code sign-in flow the Login page uses,
+/// entered from the account switcher instead of a fresh launch - a
+/// second successful sign-in just adds another cached account rather
+/// than replacing the current one (`account::AccountStore::upsert` keys
+/// on UUID).
+fn start_add_account(state: Arc<Mutex<AppData>>, widgets: Widgets) {
+    close_dropdown(&state, &widgets);
+    {
+        let mut data = state.lock().unwrap();
+        data.view = View::Login;
+    }
+    widgets.login_back_btn.set_visible(true);
+    widgets.stack.set_visible_child_name(view_name(View::Login));
+    start_sign_in(state, widgets);
+}
+
+// ─── Version picker ─────────────────────────────────────────────────
 
 /// How many recent release versions the picker offers. Mojang's
 /// manifest lists 900+ versions total (every release and snapshot ever
@@ -445,9 +1058,7 @@ fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
     }
     widgets.stack.set_visible_child_name(view_name(View::VersionPicker));
     widgets.version_status_label.set_label("Fetching version list...");
-    while let Some(child) = widgets.version_list.first_child() {
-        widgets.version_list.remove(&child);
-    }
+    clear_box(&widgets.version_list);
 
     let state1 = state.clone();
     let widgets1 = widgets.clone();
@@ -471,9 +1082,9 @@ fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
                     return;
                 }
             };
-            widgets1
-                .version_status_label
-                .set_label(&format!("{VERSION_PICKER_LIMIT} most recent releases:"));
+            widgets1.version_status_label.set_label(&format!(
+                "The {VERSION_PICKER_LIMIT} most recent releases with controller support:"
+            ));
 
             // Only releases Controlify has a Fabric build for are offered -
             // anything newer that Controlify hasn't caught up to yet would
@@ -486,13 +1097,16 @@ fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
                 .take(VERSION_PICKER_LIMIT)
                 .collect();
             for (i, entry) in releases.into_iter().enumerate() {
-                let label = if i == 0 {
-                    format!("{} (latest supported)", entry.id)
+                let text = if i == 0 {
+                    format!("{}  ·  latest supported", entry.id)
                 } else {
                     entry.id.clone()
                 };
-                let btn = gtk::Button::with_label(&label);
-                btn.set_css_classes(&["action-button"]);
+                let btn = gtk::Button::with_label(&text);
+                btn.set_css_classes(&["flat-mc", "list-item"]);
+                if let Some(child) = btn.child().and_downcast::<gtk::Label>() {
+                    child.set_xalign(0.0);
+                }
 
                 let state2 = state1.clone();
                 let widgets2 = widgets1.clone();
@@ -502,32 +1116,31 @@ fn open_version_picker(state: Arc<Mutex<AppData>>, widgets: Widgets) {
                 });
                 widgets1.version_list.append(&btn);
             }
-            widgets1.focus_default_for(View::VersionPicker);
+            // Only take focus if the player is still on this page - the
+            // fetch may finish after they've already backed out.
+            if state1.lock().unwrap().view == View::VersionPicker {
+                widgets1.focus_default_for(View::VersionPicker);
+            }
         },
     );
 }
 
 /// Adds `mc_version` as a new instance and starts installing it, unless
 /// it's already been added before (installed, failed, or mid-download)
-/// - in which case there's nothing new to do here, so just return to
-/// Home where the existing tile can be played/retried.
+/// - in which case there's nothing new to do here. Either way it
+/// becomes the selected installation and the player lands on the Play
+/// tab, where the PLAY button and progress banner reflect it.
 fn open_or_install_version(state: Arc<Mutex<AppData>>, widgets: Widgets, mc_version: String) {
-    let already_added = state
-        .lock()
-        .unwrap()
-        .instances
-        .instances
-        .iter()
-        .any(|i| i.id == mc_version);
-
-    {
+    let already_added = {
         let mut data = state.lock().unwrap();
         data.view = View::Home;
-    }
+        data.instances.instances.iter().any(|i| i.id == mc_version)
+    };
+    select_installation(&state, &mc_version);
 
     if already_added {
-        refresh_instance_grid(&state, &widgets);
-        widgets.focus_default_for(View::Home);
+        widgets.stack.set_visible_child_name(view_name(View::Home));
+        set_home_tab(&state, &widgets, HomeTab::Play);
         return;
     }
 
@@ -542,13 +1155,16 @@ fn open_or_install_version(state: Arc<Mutex<AppData>>, widgets: Widgets, mc_vers
         data.instances.instances.push(meta.clone());
         let _ = data.instances.save();
     }
-    widgets.focus_default_for(View::Home);
+    widgets.stack.set_visible_child_name(view_name(View::Home));
+    set_home_tab(&state, &widgets, HomeTab::Play);
     start_install(state, widgets, meta);
 }
 
+// ─── Install & launch ──────────────────────────────────────────────
+
 /// Downloads the vanilla client + Fabric Loader + Controlify for
 /// `meta`, updating its `InstallState`, driving `install_progress`, and
-/// re-rendering the grid when done. The progress bar only reflects
+/// re-rendering Home when done. The progress bar only reflects
 /// `instance::install_instance`'s own byte-level progress (client jar +
 /// libraries + assets, by far the dominant cost); the much smaller
 /// Fabric Loader + Controlify steps that follow aren't individually
@@ -562,12 +1178,14 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
         }
         let _ = data.instances.save();
     }
-    refresh_instance_grid(&state, &widgets);
-    widgets
-        .home_status_label
-        .set_label(&format!("Installing Minecraft {}...", meta.mc_version));
+    refresh_home(&state, &widgets);
     widgets.install_progress.set_fraction(0.0);
-    widgets.install_progress.set_visible(true);
+    show_notice(
+        &state,
+        &widgets,
+        &format!("Installing Minecraft {}...", meta.mc_version),
+        true,
+    );
 
     let widgets_progress = widgets.clone();
     let on_progress = move |done: u64, total: u64| {
@@ -618,13 +1236,13 @@ fn start_install(state: Arc<Mutex<AppData>>, widgets: Widgets, meta: InstanceMet
                 }
                 let _ = data.instances.save();
             }
-            widgets2.install_progress.set_visible(false);
-            widgets2.home_status_label.set_label(&match result {
-                Ok(None) => "Install complete.".to_string(),
+            let message = match result {
+                Ok(None) => format!("Minecraft {} is ready to play.", meta.mc_version),
                 Ok(Some(warning)) => warning,
                 Err(e) => format!("Install failed: {e}"),
-            });
-            refresh_instance_grid(&state2, &widgets2);
+            };
+            show_notice(&state2, &widgets2, &message, false);
+            refresh_home(&state2, &widgets2);
         },
     );
 }
@@ -652,11 +1270,21 @@ fn start_launch_instance(state: &Arc<Mutex<AppData>>, widgets: &Widgets, meta: I
         (account, refresh_token)
     };
     let Some(account) = account else {
-        widgets.home_status_label.set_label("Sign in or play offline first.");
+        show_notice(state, widgets, "Sign in or play offline first.", false);
         return;
     };
 
-    widgets.home_status_label.set_label("Launching...");
+    // Marked running before the token refresh, not after: the refresh
+    // is a network round trip, and a second press of PLAY during it
+    // would otherwise start a second launch.
+    state.lock().unwrap().minecraft_running = true;
+    refresh_home(state, widgets);
+    show_notice(
+        state,
+        widgets,
+        &format!("Starting Minecraft {}...", meta.mc_version),
+        false,
+    );
     match refresh_token {
         Some(rt) => {
             let state2 = state.clone();
@@ -696,14 +1324,12 @@ fn do_launch(
         },
         move |result| {
             state2.lock().unwrap().minecraft_running = false;
-            widgets2.home_status_label.set_label(match &result {
-                Ok(()) => "Minecraft exited.",
-                Err(_) => "Launch failed.",
-            });
-            if let Err(e) = &result {
-                widgets2.home_status_label.set_label(&format!("Launch failed: {e}"));
-            }
-            refresh_instance_grid(&state2, &widgets2);
+            let message = match &result {
+                Ok(()) => "Minecraft exited.".to_string(),
+                Err(e) => format!("Launch failed: {e}"),
+            };
+            show_notice(&state2, &widgets2, &message, false);
+            refresh_home(&state2, &widgets2);
         },
     );
 }
@@ -730,7 +1356,12 @@ fn start_silent_refresh(state: &Arc<Mutex<AppData>>, widgets: &Widgets, account:
             // Only act if nothing has moved the player on since this
             // refresh started (e.g. they haven't already switched
             // accounts or picked a different sign-in state by hand).
-            if !matches!(state2.lock().unwrap().auth, auth::AuthState::LoggedIn { .. }) {
+            let still_current = {
+                let data = state2.lock().unwrap();
+                matches!(data.auth, auth::AuthState::LoggedIn { .. })
+                    && data.accounts.active_uuid.as_deref() == Some(account.uuid.as_str())
+            };
+            if !still_current {
                 return;
             }
             let msa = match result {
@@ -798,165 +1429,129 @@ fn fall_back_to_offline(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
     }
 }
 
-// ─── Accounts ───────────────────────────────────────────────────────
-// Switching or adding an account is Home-adjacent, not its own auth
-// flow: switching just re-points AppData.accounts.active_uuid and
-// derives an optimistic AuthState from the cached entry (no network
-// call - matches PLAN.md §3's "Home renders immediately from cache").
-// Adding another Microsoft account reuses the exact same Login-page
-// device-code flow, just entered from here instead of a fresh launch.
-fn refresh_accounts_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
-    while let Some(child) = widgets.accounts_list.first_child() {
-        widgets.accounts_list.remove(&child);
-    }
+// ─── Navigation ─────────────────────────────────────────────────────
 
-    let (accounts, active_uuid) = {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nav {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Routes one D-Pad/arrow step. Home is laid out in two dimensions (a
+/// top bar of tabs, a bottom bar of controls, a list of installation
+/// rows each with its own buttons), so it gets an explicit row/column
+/// grid (`home_nav_rows` + `grid_step`) instead of GTK's geometric
+/// `child_focus` search - the same reasoning as PLAN.md §5, lesson 4,
+/// applied in both directions. The other pages are single columns and
+/// keep the document-order walk in `step_focus`.
+fn navigate(state: &Arc<Mutex<AppData>>, widgets: &Widgets, dir: Nav) -> bool {
+    let view = state.lock().unwrap().view;
+    match view {
+        View::Home => {
+            let rows = home_nav_rows(state, widgets);
+            let focused = gtk::prelude::RootExt::focus(&widgets.window);
+            grid_step(&rows, focused.as_ref(), dir)
+        }
+        _ => match dir {
+            Nav::Up => step_focus(&widgets.window, false),
+            Nav::Down => step_focus(&widgets.window, true),
+            Nav::Left => widgets.window.child_focus(gtk::DirectionType::Left),
+            Nav::Right => widgets.window.child_focus(gtk::DirectionType::Right),
+        },
+    }
+}
+
+/// Home's focusable controls as rows, top to bottom. An open dropdown
+/// is modal: its items are the only rows, so the D-Pad can't wander out
+/// of it onto the dimmed page behind.
+fn home_nav_rows(state: &Arc<Mutex<AppData>>, widgets: &Widgets) -> Vec<Vec<gtk::Widget>> {
+    let (tab, dropdown) = {
         let data = state.lock().unwrap();
-        (data.accounts.accounts.clone(), data.accounts.active_uuid.clone())
+        (data.home_tab, data.dropdown)
     };
-    for acc in accounts {
-        let is_active = active_uuid.as_deref() == Some(acc.uuid.as_str());
-        let kind = if acc.refresh_token.is_some() { "Microsoft" } else { "Offline" };
-        let label = if is_active {
-            format!("{} ({kind}) — Active", acc.username)
-        } else {
-            format!("Switch to {} ({kind})", acc.username)
+    if let Some(which) = dropdown {
+        let panel = match which {
+            Dropdown::Accounts => &widgets.accounts_panel,
+            Dropdown::Versions => &widgets.versions_panel,
         };
-        let btn = gtk::Button::with_label(&label);
-        btn.set_css_classes(&["action-button"]);
-        btn.set_sensitive(!is_active);
-
-        let state_for_btn = state.clone();
-        let widgets_for_btn = widgets.clone();
-        let uuid = acc.uuid.clone();
-        btn.connect_clicked(move |_| switch_active_account(&state_for_btn, &widgets_for_btn, uuid.clone()));
-        widgets.accounts_list.append(&btn);
+        return focusables(panel.upcast_ref())
+            .into_iter()
+            .map(|w| vec![w])
+            .collect();
     }
+
+    let mut rows = vec![focusables(widgets.top_bar.upcast_ref())];
+    match tab {
+        HomeTab::Play => {
+            let bottom: Vec<gtk::Widget> = [
+                widgets.version_btn.clone().upcast::<gtk::Widget>(),
+                widgets.play_btn.clone().upcast(),
+            ]
+            .into_iter()
+            .filter(|w| w.is_sensitive())
+            .collect();
+            rows.push(bottom);
+        }
+        HomeTab::Installations => {
+            rows.push(vec![widgets.new_install_btn.clone().upcast()]);
+            let mut child = widgets.installs_list.first_child();
+            while let Some(row) = child {
+                rows.push(focusables(&row));
+                child = row.next_sibling();
+            }
+        }
+    }
+    rows
 }
 
-/// Derives an optimistic `AuthState` from a cached account with no
-/// network call: `LoggedIn` if it has a refresh token (upgraded to a
-/// freshly-verified session by a silent refresh shortly after, see
-/// `start_silent_refresh`), `OfflinePlaying` otherwise. `None` means no
-/// account has ever been cached at all.
-fn auth_state_for_cached(account: Option<&CachedAccount>) -> auth::AuthState {
-    match account {
-        Some(account) if account.refresh_token.is_some() => auth::AuthState::LoggedIn {
-            profile: auth::McProfile {
-                id: account.uuid.clone(),
-                name: account.username.clone(),
-            },
-        },
-        Some(account) => auth::AuthState::OfflinePlaying {
-            profile: account.clone(),
-        },
-        None => auth::AuthState::NeedsLogin { cached: None },
-    }
-}
-
-fn switch_active_account(state: &Arc<Mutex<AppData>>, widgets: &Widgets, uuid: String) {
-    let new_auth = {
-        let mut data = state.lock().unwrap();
-        data.accounts.active_uuid = Some(uuid);
-        let _ = data.accounts.save();
-        let auth_state = auth_state_for_cached(data.accounts.active());
-        data.auth = auth_state.clone();
-        data.view = View::Home;
-        auth_state
+/// Moves focus one step across `rows`. Left/Right stay within the
+/// current row; Up/Down move to the neighbouring row, keeping the
+/// column where that row is wide enough. Never wraps. Returns whether
+/// focus moved.
+fn grid_step(rows: &[Vec<gtk::Widget>], focused: Option<&gtk::Widget>, dir: Nav) -> bool {
+    let rows: Vec<&Vec<gtk::Widget>> = rows.iter().filter(|r| !r.is_empty()).collect();
+    let position = focused.and_then(|f| {
+        rows.iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|w| w == f).map(|c| (r, c)))
+    });
+    let Some((r, c)) = position else {
+        // Focus is nowhere sensible (e.g. its widget was just rebuilt
+        // away) - recover onto the first control rather than ignoring
+        // the press.
+        return rows
+            .first()
+            .and_then(|row| row.first())
+            .is_some_and(|w| w.grab_focus());
     };
-    render_auth_state(widgets, &new_auth);
-    refresh_instance_grid(state, widgets);
-    widgets.focus_default_for(View::Home);
-}
-
-/// Opens the same device-code sign-in flow the Login page uses,
-/// entered from Accounts instead of a fresh launch - a second
-/// successful sign-in just adds another cached account rather than
-/// replacing the current one (`account::AccountStore::upsert` keys on
-/// UUID).
-fn start_add_account(state: Arc<Mutex<AppData>>, widgets: Widgets) {
-    {
-        let mut data = state.lock().unwrap();
-        data.view = View::Login;
-    }
-    widgets.stack.set_visible_child_name(view_name(View::Login));
-    start_sign_in(state, widgets);
-}
-
-fn open_accounts(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
-    state.lock().unwrap().view = View::Accounts;
-    refresh_accounts_list(state, widgets);
-    widgets.focus_default_for(View::Accounts);
-}
-
-// ─── Settings ───────────────────────────────────────────────────────
-// The one setting worth exposing right now: freeing disk space by
-// deleting an installed instance. There was previously no way to do
-// this at all once an instance was added.
-fn refresh_settings_list(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
-    while let Some(child) = widgets.settings_list.first_child() {
-        widgets.settings_list.remove(&child);
-    }
-
-    let instances = state.lock().unwrap().instances.instances.clone();
-    for meta in instances {
-        let loader_tag = match meta.loader {
-            instance::Loader::Fabric => "Fabric",
-            instance::Loader::Vanilla => "Vanilla",
-        };
-        let btn = gtk::Button::with_label(&format!("Delete {} ({loader_tag})", meta.mc_version));
-        btn.set_css_classes(&["action-button"]);
-
-        let state_for_btn = state.clone();
-        let widgets_for_btn = widgets.clone();
-        let id = meta.id.clone();
-        btn.connect_clicked(move |_| delete_instance(&state_for_btn, &widgets_for_btn, id.clone()));
-        widgets.settings_list.append(&btn);
-    }
-}
-
-fn delete_instance(state: &Arc<Mutex<AppData>>, widgets: &Widgets, id: String) {
-    {
-        let mut data = state.lock().unwrap();
-        data.instances.instances.retain(|i| i.id != id);
-        let _ = data.instances.save();
-    }
-    let _ = std::fs::remove_dir_all(InstanceStore::instance_dir(&id));
-    refresh_settings_list(state, widgets);
-    widgets.focus_default_for(View::Settings);
-}
-
-fn open_settings(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
-    state.lock().unwrap().view = View::Settings;
-    refresh_settings_list(state, widgets);
-    widgets.focus_default_for(View::Settings);
+    let target = match dir {
+        Nav::Left => c.checked_sub(1).map(|c| &rows[r][c]),
+        Nav::Right => rows[r].get(c + 1),
+        Nav::Up => r.checked_sub(1).map(|r| &rows[r][c.min(rows[r].len() - 1)]),
+        Nav::Down => rows.get(r + 1).map(|row| &row[c.min(row.len() - 1)]),
+    };
+    target.is_some_and(|w| w.grab_focus())
 }
 
 /// Moves focus to the next/previous focusable widget in document order,
 /// instead of GTK's generic geometric `child_focus` search (PLAN.md §5,
 /// lesson 4). That search is unreliable across a tall stack of
 /// same-sized buttons - the exact bug gamepad-2048 hit for its
-/// board-size row - and manifests here on any of the longer lists
-/// (version picker, instance grid, accounts, settings): Up/Down would
-/// unpredictably skip several rows at once instead of moving one at a
-/// time.
+/// board-size row - and manifests on the longer single-column lists
+/// (the version picker especially): Up/Down would unpredictably skip
+/// several rows at once instead of moving one at a time.
 ///
-/// Most screens lay their focusable controls out as flat siblings in a
-/// single vertical `gtk::Box`, where "the literal next/previous
-/// sibling" is exactly "the next item down/up". But Home and Accounts
-/// nest their list of tiles inside its own `gtk::Box` (`instance_list`,
-/// `accounts_list`) with the "Add" button as a sibling of *that box*,
-/// not of the tiles inside it - so a flat sibling-only walk can never
-/// step off the last tile onto "Add". `focus_relative` below climbs to
-/// the parent and keeps looking there once a container's own siblings
-/// are exhausted, and descends into a sibling that's itself a container
-/// to find its first/last focusable descendant - a real (if small)
-/// preorder tree walk rather than a single sibling hop. It stops dead
-/// at each screen's own top-level page `Box` (detected by the page
-/// being a direct child of `stack`) rather than climbing further, so it
-/// can never wrap around into a different, hidden page's own widgets.
-/// Deliberately doesn't wrap at the ends of a screen, same as
-/// gamepad-2048's own documented behavior.
+/// `focus_relative` below climbs to the parent and keeps looking there
+/// once a container's own siblings are exhausted, and descends into a
+/// sibling that's itself a container to find its first/last focusable
+/// descendant - a real (if small) preorder tree walk rather than a
+/// single sibling hop. It stops dead at each screen's own top-level page
+/// (detected by the page being a direct child of `stack`) rather than
+/// climbing further, so it can never wrap around into a different,
+/// hidden page's own widgets. Deliberately doesn't wrap at the ends of a
+/// screen, same as gamepad-2048's own documented behavior.
 fn step_focus(window: &ApplicationWindow, forward: bool) -> bool {
     let Some(focused) = gtk::prelude::RootExt::focus(window) else {
         return false;
@@ -986,9 +1581,9 @@ fn focus_relative(from: &gtk::Widget, forward: bool) -> bool {
                     return false;
                 };
                 // Never escape the current Stack page - each page's
-                // top-level Box is a traversal boundary, so this can't
-                // wrap into a completely different (hidden) page's own
-                // widgets by climbing too far.
+                // top-level widget is a traversal boundary, so this
+                // can't wrap into a completely different (hidden) page's
+                // own widgets by climbing too far.
                 if parent.downcast_ref::<gtk::Stack>().is_some() {
                     return false;
                 }
@@ -1002,6 +1597,9 @@ fn focus_relative(from: &gtk::Widget, forward: bool) -> bool {
 /// - the first (or last, going backward) focusable widget among its own
 /// descendants, checked in order.
 fn focus_into(widget: &gtk::Widget, forward: bool) -> bool {
+    if !widget.is_visible() {
+        return false;
+    }
     if widget.grab_focus() {
         return true;
     }
@@ -1027,25 +1625,27 @@ fn focus_into(widget: &gtk::Widget, forward: bool) -> bool {
 // signals is individually a perfectly valid single-step move, so
 // without a shared cooldown across *both* input paths, one physical
 // press could step several rows at once - which is exactly what
-// "skips rows" looked like, even though each individual `step_focus`
-// call only ever moves one row on its own.
+// "skips rows" looked like, even though each individual step only ever
+// moves one row on its own.
 const DPAD_NAV_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(450);
 
-/// Steps focus unless another accepted step (from *either* input path)
+/// Navigates unless another accepted step (from *either* input path)
 /// happened within `DPAD_NAV_DEBOUNCE`. `gate` must be shared between
 /// the gamepad and keyboard handlers - a debounce scoped to only one of
 /// them can't catch a duplicate arriving through the other.
-fn nav_step_if_not_debounced(
+fn nav_if_not_debounced(
     gate: &Rc<RefCell<std::time::Instant>>,
-    window: &ApplicationWindow,
-    forward: bool,
+    state: &Arc<Mutex<AppData>>,
+    widgets: &Widgets,
+    dir: Nav,
 ) -> bool {
     let mut last = gate.borrow_mut();
     if last.elapsed() < DPAD_NAV_DEBOUNCE {
         return false;
     }
     *last = std::time::Instant::now();
-    step_focus(window, forward)
+    drop(last);
+    navigate(state, widgets, dir)
 }
 
 // ─── Gamepad confirm/back dispatch ─────────────────────────────────
@@ -1078,17 +1678,51 @@ fn handle_gp_back(state: &Arc<Mutex<AppData>>, widgets: &Widgets) {
                 drop(data);
                 render_auth_state(widgets, &snapshot);
                 widgets.sign_in_btn.grab_focus();
+            } else if data.accounts.active().is_some() {
+                drop(data);
+                return_home_from_login(state, widgets);
             } else {
                 drop(data);
                 widgets.window.close();
             }
         }
-        View::VersionPicker | View::InstanceDetail | View::Accounts | View::Settings => {
+        View::VersionPicker => {
             data.view = View::Home;
             drop(data);
             widgets.focus_default_for(View::Home);
         }
-        View::Home => drop(data), // TODO: quit-confirm overlay
+        View::Home => {
+            if data.dropdown.is_some() {
+                drop(data);
+                close_dropdown(state, widgets);
+            } else if data.home_tab == HomeTab::Installations {
+                drop(data);
+                set_home_tab(state, widgets, HomeTab::Play);
+            }
+            // TODO: quit-confirm overlay on the Play tab.
+        }
+    }
+}
+
+/// X/Y/shoulder-button shortcuts, shared by the gamepad and keyboard
+/// paths.
+fn handle_home_shortcut(state: &Arc<Mutex<AppData>>, widgets: &Widgets, action: GamepadAction) {
+    if !is_on_home(state) {
+        return;
+    }
+    match action {
+        GamepadAction::OpenAccounts => toggle_dropdown(state, widgets, Dropdown::Accounts),
+        GamepadAction::OpenVersions => toggle_dropdown(state, widgets, Dropdown::Versions),
+        GamepadAction::PrevTab | GamepadAction::NextTab => {
+            let (tab, dropdown) = {
+                let data = state.lock().unwrap();
+                (data.home_tab, data.dropdown)
+            };
+            if dropdown.is_none() {
+                set_home_tab(state, widgets, other_tab(tab));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1109,265 +1743,389 @@ fn main() {
     app.run();
 }
 
+fn bundled_texture(bytes: &'static [u8]) -> gdk::Texture {
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(bytes))
+        .expect("bundled PNG failed to decode")
+}
+
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::new(app);
     window.set_title(Some("Minecraft"));
     window.set_default_size(1280, 800);
 
-    // ── Theme: Minecraft palette (grass green, dirt brown, stone grey)
-    // on a true black dark-mode background, matching the app icon.
+    // ── Theme: the official launcher's charcoal-and-green look (see
+    // style.css), on GTK's dark variant so scrollbars etc. match.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(true);
+    }
     let css_provider = gtk::CssProvider::new();
-    css_provider.load_from_data(
-        r#"
-        @define-color mc_grass #5D9C34;
-        @define-color mc_grass_bright #7CC53E;
-        @define-color mc_dirt #6B4A2C;
-        @define-color mc_stone #3A3A3A;
-        @define-color mc_stone_light #4A4A4A;
-        @define-color mc_stone_dark #1C1C1C;
-
-        * { font-family: "Ubuntu Sans", "Ubuntu", sans-serif; }
-        window { background-color: #0D0D0D; color: #FFFFFF; }
-
-        .page { padding: 40px; }
-        .game-title { font-size: 44px; font-weight: 800; color: @mc_grass_bright; }
-        .control-hint {
-            font-size: 13px; font-weight: 500; letter-spacing: 0.5px;
-            color: alpha(#FFFFFF, 0.55);
-        }
-        .user-code {
-            font-size: 32px; font-weight: 700; letter-spacing: 4px;
-            color: @mc_grass_bright;
-        }
-
-        button.action-button {
-            padding: 14px 24px; border-radius: 14px;
-            border: 2px solid alpha(@mc_dirt, 0.7);
-            background-color: @mc_stone;
-            background-image: none;
-            box-shadow: none;
-            color: #FFFFFF; font-size: 16px; font-weight: 600;
-            min-height: 48px; min-width: 260px;
-            transition: all 120ms ease-out;
-        }
-        button.action-button:hover { background-color: @mc_stone_light; }
-        button.action-button:focus, button.action-button:active {
-            background-color: @mc_grass;
-            border-color: @mc_grass_bright;
-            box-shadow: 0 0 0 3px alpha(@mc_grass, 0.35);
-            outline: none;
-        }
-        button.action-button:disabled {
-            background-color: @mc_stone_dark; color: alpha(#FFFFFF, 0.45);
-        }
-
-        progressbar > trough {
-            background-color: @mc_stone_dark;
-            border-radius: 8px;
-            min-height: 14px;
-        }
-        progressbar > trough > progress {
-            background-color: @mc_grass;
-            background-image: none;
-            border-radius: 8px;
-        }
-        "#,
-    );
+    css_provider.load_from_data(include_str!("style.css"));
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("no display"),
+        &gdk::Display::default().expect("no display"),
         &css_provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let stack = gtk::Stack::new();
+    // ── Bundled artwork, generated by examples/gen_art.rs ──
+    let hero_texture = bundled_texture(include_bytes!("../data/art/hero.png"));
+    let logo_texture = bundled_texture(include_bytes!("../data/art/logo.png"));
+    let grass_icon = bundled_texture(include_bytes!("../data/art/grass_block.png"));
 
-    // ── App icon, shared between the Login and Home screens ──
-    let app_icon_bytes = include_bytes!("../data/icons/com.github.gamepadminecraft.png");
-    let app_icon_texture =
-        gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(app_icon_bytes))
-            .expect("bundled app icon PNG failed to decode");
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
     // ── Login page ──
-    let login_page = gtk::Box::new(gtk::Orientation::Vertical, 20);
-    login_page.set_css_classes(&["page"]);
-    login_page.set_halign(gtk::Align::Center);
-    login_page.set_valign(gtk::Align::Center);
+    // The key art, dimmed, behind the logo and a sign-in card.
+    let login_page = gtk::Overlay::new();
+    let login_bg = gtk::Picture::for_paintable(&hero_texture);
+    login_bg.set_content_fit(gtk::ContentFit::Cover);
+    login_bg.set_can_shrink(true);
+    login_page.set_child(Some(&login_bg));
+    let login_scrim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    login_scrim.add_css_class("scrim");
+    login_page.add_overlay(&login_scrim);
 
-    let login_icon = gtk::Picture::for_paintable(&app_icon_texture);
-    login_icon.set_size_request(96, 96);
-    login_icon.set_content_fit(gtk::ContentFit::Contain);
-    login_icon.set_can_shrink(true);
-    login_page.append(&login_icon);
+    let login_column = gtk::Box::new(gtk::Orientation::Vertical, 20);
+    login_column.set_halign(gtk::Align::Center);
+    login_column.set_valign(gtk::Align::Center);
+    let login_logo = gtk::Picture::for_paintable(&logo_texture);
+    login_logo.set_can_shrink(true);
+    login_column.append(&login_logo);
 
-    let title = gtk::Label::new(Some("Minecraft"));
-    title.set_css_classes(&["game-title"]);
-    login_page.append(&title);
+    let login_card = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    login_card.add_css_class("login-card");
+    login_card.set_halign(gtk::Align::Center);
+    login_card.set_size_request(460, -1);
 
     let login_status_label = gtk::Label::new(Some("Loading..."));
+    login_status_label.add_css_class("login-status");
     login_status_label.set_wrap(true);
+    login_status_label.set_max_width_chars(40);
     login_status_label.set_justify(gtk::Justification::Center);
-    login_page.append(&login_status_label);
+    login_card.append(&login_status_label);
 
     let qr_picture = gtk::Picture::new();
-    qr_picture.set_size_request(260, 260);
+    qr_picture.set_size_request(220, 220);
     qr_picture.set_content_fit(gtk::ContentFit::Contain);
     qr_picture.set_visible(false);
-    login_page.append(&qr_picture);
+    login_card.append(&qr_picture);
 
     let user_code_label = gtk::Label::new(None);
-    user_code_label.set_css_classes(&["user-code"]);
+    user_code_label.add_css_class("user-code");
     user_code_label.set_visible(false);
-    login_page.append(&user_code_label);
+    login_card.append(&user_code_label);
 
     let sign_in_btn = gtk::Button::with_label("Sign in with Microsoft");
-    sign_in_btn.set_css_classes(&["action-button"]);
-    login_page.append(&sign_in_btn);
+    sign_in_btn.set_css_classes(&["flat-mc", "mc-button", "green"]);
+    login_card.append(&sign_in_btn);
 
     let play_offline_btn = gtk::Button::with_label("Play Offline");
-    play_offline_btn.set_css_classes(&["action-button"]);
-    login_page.append(&play_offline_btn);
+    play_offline_btn.set_css_classes(&["flat-mc", "mc-button"]);
+    login_card.append(&play_offline_btn);
 
-    let login_hint = gtk::Label::new(Some("A: Select  •  B: Cancel / Quit"));
-    login_hint.set_css_classes(&["control-hint"]);
-    login_page.append(&login_hint);
+    let login_back_btn = gtk::Button::with_label("Back");
+    login_back_btn.set_css_classes(&["flat-mc", "mc-button"]);
+    login_back_btn.set_visible(false);
+    login_card.append(&login_back_btn);
 
+    let login_hint = gtk::Label::new(Some("A Select  ·  B Cancel / Back"));
+    login_hint.add_css_class("control-hint");
+    login_card.append(&login_hint);
+
+    login_column.append(&login_card);
+    login_page.add_overlay(&login_column);
     stack.add_named(&login_page, Some(view_name(View::Login)));
 
     // ── Home page ──
-    let home_page = gtk::Box::new(gtk::Orientation::Vertical, 20);
-    home_page.set_css_classes(&["page"]);
-    home_page.set_halign(gtk::Align::Center);
-    home_page.set_valign(gtk::Align::Center);
+    // Top bar: account switcher | edition title + tabs | hint, quit.
+    let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    top_bar.add_css_class("top-bar");
 
-    let home_icon = gtk::Picture::for_paintable(&app_icon_texture);
-    home_icon.set_size_request(96, 96);
-    home_icon.set_content_fit(gtk::ContentFit::Contain);
-    home_icon.set_can_shrink(true);
-    home_page.append(&home_icon);
+    let account_btn = gtk::Button::new();
+    account_btn.set_css_classes(&["flat-mc", "account-switcher"]);
+    let account_row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    let account_avatar = gtk::Image::new();
+    account_avatar.set_pixel_size(48);
+    let avatar_frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    avatar_frame.add_css_class("avatar");
+    avatar_frame.set_overflow(gtk::Overflow::Hidden);
+    avatar_frame.set_valign(gtk::Align::Center);
+    avatar_frame.append(&account_avatar);
+    account_row.append(&avatar_frame);
+    let account_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    account_text.set_hexpand(true);
+    account_text.set_valign(gtk::Align::Center);
+    let account_name_label = label("", &["account-name"]);
+    account_name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    account_name_label.set_max_width_chars(16);
+    let account_kind_label = label("", &["account-kind"]);
+    account_text.append(&account_name_label);
+    account_text.append(&account_kind_label);
+    account_row.append(&account_text);
+    let account_chevron = icon_image("pan-down-symbolic", 16);
+    account_chevron.set_valign(gtk::Align::Start);
+    account_row.append(&account_chevron);
+    account_btn.set_child(Some(&account_row));
+    // The expanding text column inside would otherwise make the whole
+    // switcher grab spare top-bar width on wide screens.
+    account_btn.set_hexpand(false);
+    top_bar.append(&account_btn);
 
-    let home_title = gtk::Label::new(Some("Minecraft"));
-    home_title.set_css_classes(&["game-title"]);
-    home_page.append(&home_title);
+    let title_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    title_column.set_margin_start(22);
+    title_column.set_valign(gtk::Align::End);
+    let edition_title = label("MINECRAFT: JAVA EDITION", &["edition-title"]);
+    edition_title.set_margin_start(14);
+    edition_title.set_margin_top(12);
+    title_column.append(&edition_title);
+    let tab_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let tab_button = |text: &str| {
+        let btn = gtk::Button::new();
+        btn.set_css_classes(&["flat-mc", "tab"]);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&gtk::Label::new(Some(text)));
+        let underline = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        underline.add_css_class("underline");
+        underline.set_halign(gtk::Align::Center);
+        column.append(&underline);
+        btn.set_child(Some(&column));
+        btn
+    };
+    let tab_play_btn = tab_button("Play");
+    tab_play_btn.add_css_class("active");
+    let tab_installs_btn = tab_button("Installations");
+    tab_row.append(&tab_play_btn);
+    tab_row.append(&tab_installs_btn);
+    title_column.append(&tab_row);
+    top_bar.append(&title_column);
 
-    let home_status_label = gtk::Label::new(None);
-    home_page.append(&home_status_label);
+    let top_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    top_spacer.set_hexpand(true);
+    top_bar.append(&top_spacer);
+    let home_hint = gtk::Label::new(Some(HINT_PLAY));
+    home_hint.add_css_class("control-hint");
+    home_hint.set_margin_end(12);
+    top_bar.append(&home_hint);
+    let quit_btn = gtk::Button::new();
+    quit_btn.set_css_classes(&["flat-mc", "icon-btn"]);
+    quit_btn.set_child(Some(&icon_image("window-close-symbolic", 24)));
+    quit_btn.set_tooltip_text(Some("Quit"));
+    quit_btn.set_valign(gtk::Align::Center);
+    quit_btn.set_margin_end(12);
+    top_bar.append(&quit_btn);
 
+    // Tab content: the key art + logo, or the installation list.
+    let home_tabs = gtk::Stack::new();
+    home_tabs.set_vexpand(true);
+    home_tabs.set_transition_type(gtk::StackTransitionType::Crossfade);
+
+    let hero_overlay = gtk::Overlay::new();
+    let hero = gtk::Picture::for_paintable(&hero_texture);
+    hero.set_content_fit(gtk::ContentFit::Cover);
+    hero.set_can_shrink(true);
+    hero_overlay.set_child(Some(&hero));
+    let hero_logo = gtk::Picture::for_paintable(&logo_texture);
+    hero_logo.set_can_shrink(true);
+    hero_logo.set_halign(gtk::Align::Center);
+    hero_logo.set_valign(gtk::Align::Start);
+    hero_logo.set_margin_top(28);
+    hero_overlay.add_overlay(&hero_logo);
+    home_tabs.add_named(&hero_overlay, Some("play"));
+
+    let installs_page = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    installs_page.add_css_class("installs-page");
+    let installs_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let installs_title = label("Installations", &["page-title"]);
+    installs_title.set_hexpand(true);
+    installs_header.append(&installs_title);
+    let new_install_btn = gtk::Button::with_label("New installation");
+    new_install_btn.set_css_classes(&["flat-mc", "mc-button", "green"]);
+    installs_header.append(&new_install_btn);
+    installs_page.append(&installs_header);
+    let installs_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let installs_scroll = gtk::ScrolledWindow::new();
+    installs_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    installs_scroll.set_vexpand(true);
+    installs_scroll.set_child(Some(&installs_list));
+    installs_page.append(&installs_scroll);
+    home_tabs.add_named(&installs_page, Some("installations"));
+
+    // Bottom bar: installation selector | (PLAY, overlaid) | account.
+    let bottom_bar = gtk::CenterBox::new();
+    bottom_bar.add_css_class("bottom-bar");
+    let version_btn = gtk::Button::new();
+    version_btn.set_css_classes(&["flat-mc", "version-select"]);
+    version_btn.set_valign(gtk::Align::Center);
+    let version_row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    let grass = gtk::Image::from_paintable(Some(&grass_icon));
+    grass.set_pixel_size(40);
+    version_row.append(&grass);
+    let version_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    version_text.set_hexpand(true);
+    version_text.set_valign(gtk::Align::Center);
+    let version_title_label = label("", &["item-title"]);
+    let version_subtitle_label = label("", &["item-subtitle"]);
+    version_text.append(&version_title_label);
+    version_text.append(&version_subtitle_label);
+    version_row.append(&version_text);
+    version_row.append(&icon_image("pan-down-symbolic", 16));
+    version_btn.set_child(Some(&version_row));
+    version_btn.set_hexpand(false);
+    bottom_bar.set_start_widget(Some(&version_btn));
+    // Reserves the middle for the PLAY button, which is overlaid on
+    // top so it can straddle the hero and the bar like the official
+    // launcher's.
+    let play_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    play_slot.set_size_request(400, -1);
+    bottom_bar.set_center_widget(Some(&play_slot));
+    let bottom_account_label = gtk::Label::new(None);
+    bottom_account_label.add_css_class("bottom-account");
+    bottom_account_label.set_margin_end(8);
+    bottom_account_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    bottom_bar.set_end_widget(Some(&bottom_account_label));
+
+    let home_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    home_column.append(&top_bar);
+    home_column.append(&home_tabs);
+    home_column.append(&bottom_bar);
+
+    let home_page = gtk::Overlay::new();
+    home_page.set_child(Some(&home_column));
+
+    let play_btn = gtk::Button::new();
+    play_btn.set_css_classes(&["flat-mc", "play"]);
+    play_btn.set_halign(gtk::Align::Center);
+    play_btn.set_valign(gtk::Align::End);
+    play_btn.set_margin_bottom(30);
+    let play_label = gtk::Picture::for_paintable(&play_label_texture("PLAY"));
+    // A Picture measured against the button's full width would scale
+    // itself up to fill it; inside a non-expanding horizontal box it
+    // keeps the texture's own pixel size.
+    let play_label_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    play_label_box.set_halign(gtk::Align::Center);
+    play_label_box.set_valign(gtk::Align::Center);
+    play_label_box.append(&play_label);
+    play_btn.set_child(Some(&play_label_box));
+    home_page.add_overlay(&play_btn);
+
+    let notice = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    notice.add_css_class("notice");
+    notice.set_halign(gtk::Align::End);
+    notice.set_valign(gtk::Align::End);
+    notice.set_margin_end(24);
+    notice.set_margin_bottom(132);
+    notice.set_visible(false);
+    let notice_label = gtk::Label::new(None);
+    notice_label.set_wrap(true);
+    notice_label.set_max_width_chars(36);
+    notice_label.set_justify(gtk::Justification::Center);
+    notice.append(&notice_label);
     let install_progress = gtk::ProgressBar::new();
-    install_progress.set_size_request(400, -1);
     install_progress.set_visible(false);
-    home_page.append(&install_progress);
+    notice.append(&install_progress);
+    // Tapping the banner dismisses it.
+    let notice_tap = gtk::GestureClick::new();
+    {
+        let notice = notice.clone();
+        let progress = install_progress.clone();
+        notice_tap.connect_released(move |_, _, _, _| {
+            if !progress.is_visible() {
+                notice.set_visible(false);
+            }
+        });
+    }
+    notice.add_controller(notice_tap);
+    home_page.add_overlay(&notice);
 
-    let instance_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    home_page.append(&instance_list);
+    let scrim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    scrim.add_css_class("scrim");
+    scrim.set_visible(false);
+    home_page.add_overlay(&scrim);
 
-    let add_instance_btn = gtk::Button::with_label("Add Instance");
-    add_instance_btn.set_css_classes(&["action-button"]);
-    home_page.append(&add_instance_btn);
+    let dropdown_panel = |heading: &str, footer: &gtk::Button| {
+        let panel = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        panel.add_css_class("dropdown");
+        panel.set_size_request(400, -1);
+        panel.set_halign(gtk::Align::Start);
+        panel.set_visible(false);
+        let title = label(heading, &["dropdown-heading"]);
+        panel.append(&title);
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_max_content_height(380);
+        scroll.set_child(Some(&items));
+        panel.append(&scroll);
+        panel.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        panel.append(footer);
+        (panel, items)
+    };
 
-    let quit_btn = gtk::Button::with_label("Quit");
-    quit_btn.set_css_classes(&["action-button"]);
-    home_page.append(&quit_btn);
+    let add_account_btn = dropdown_item(
+        &icon_image("list-add-symbolic", 24),
+        "Add a Microsoft account",
+        "Sign in with a QR code",
+        false,
+    );
+    let (accounts_panel, accounts_items) = dropdown_panel("ACCOUNTS", &add_account_btn);
+    accounts_panel.set_valign(gtk::Align::Start);
+    accounts_panel.set_margin_top(96);
+    accounts_panel.set_margin_start(12);
+    home_page.add_overlay(&accounts_panel);
 
-    let home_hint = gtk::Label::new(Some(
-        "A: Select  •  B: Quit  •  X: Accounts  •  Y: Settings",
-    ));
-    home_hint.set_css_classes(&["control-hint"]);
-    home_page.append(&home_hint);
+    let new_install_item = dropdown_item(
+        &icon_image("list-add-symbolic", 24),
+        "New installation",
+        "Download another Minecraft version",
+        false,
+    );
+    let (versions_panel, versions_items) = dropdown_panel("INSTALLATIONS", &new_install_item);
+    versions_panel.set_valign(gtk::Align::End);
+    versions_panel.set_margin_bottom(104);
+    versions_panel.set_margin_start(16);
+    home_page.add_overlay(&versions_panel);
 
     stack.add_named(&home_page, Some(view_name(View::Home)));
 
     // ── Version picker page ──
     let version_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    version_page.set_css_classes(&["page"]);
-    version_page.set_halign(gtk::Align::Center);
+    version_page.add_css_class("installs-page");
+    let version_header = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let version_back_btn = gtk::Button::with_label("Back");
+    version_back_btn.set_css_classes(&["flat-mc", "mc-button"]);
+    version_header.append(&version_back_btn);
+    version_header.append(&label("New installation", &["page-title"]));
+    version_page.append(&version_header);
 
-    let version_title = gtk::Label::new(Some("Choose a Version"));
-    version_title.set_css_classes(&["game-title"]);
-    version_page.append(&version_title);
-
-    let version_status_label = gtk::Label::new(Some("Fetching version list..."));
+    let version_status_label = label("Fetching version list...", &["item-subtitle"]);
     version_page.append(&version_status_label);
 
     let version_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let version_scroll = gtk::ScrolledWindow::new();
     version_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    version_scroll.set_min_content_height(500);
+    version_scroll.set_vexpand(true);
     version_scroll.set_child(Some(&version_list));
     version_page.append(&version_scroll);
 
-    let version_hint = gtk::Label::new(Some("A: Select  •  B: Back"));
-    version_hint.set_css_classes(&["control-hint"]);
+    let version_hint = gtk::Label::new(Some("A Install  ·  B Back"));
+    version_hint.add_css_class("control-hint");
     version_page.append(&version_hint);
 
     stack.add_named(&version_page, Some(view_name(View::VersionPicker)));
-
-    // ── Accounts page ──
-    let accounts_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    accounts_page.set_css_classes(&["page"]);
-    accounts_page.set_halign(gtk::Align::Center);
-
-    let accounts_title = gtk::Label::new(Some("Accounts"));
-    accounts_title.set_css_classes(&["game-title"]);
-    accounts_page.append(&accounts_title);
-
-    let accounts_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let accounts_scroll = gtk::ScrolledWindow::new();
-    accounts_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    accounts_scroll.set_min_content_height(300);
-    accounts_scroll.set_child(Some(&accounts_list));
-    accounts_page.append(&accounts_scroll);
-
-    let add_account_btn = gtk::Button::with_label("Sign in with another Microsoft account");
-    add_account_btn.set_css_classes(&["action-button"]);
-    accounts_page.append(&add_account_btn);
-
-    let accounts_hint = gtk::Label::new(Some("A: Switch  •  B: Back"));
-    accounts_hint.set_css_classes(&["control-hint"]);
-    accounts_page.append(&accounts_hint);
-
-    stack.add_named(&accounts_page, Some(view_name(View::Accounts)));
-
-    // ── Settings page ──
-    let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    settings_page.set_css_classes(&["page"]);
-    settings_page.set_halign(gtk::Align::Center);
-
-    let settings_title = gtk::Label::new(Some("Settings"));
-    settings_title.set_css_classes(&["game-title"]);
-    settings_page.append(&settings_title);
-
-    let settings_subtitle = gtk::Label::new(Some("Installed instances"));
-    settings_subtitle.set_css_classes(&["control-hint"]);
-    settings_page.append(&settings_subtitle);
-
-    let settings_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let settings_scroll = gtk::ScrolledWindow::new();
-    settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    settings_scroll.set_min_content_height(300);
-    settings_scroll.set_child(Some(&settings_list));
-    settings_page.append(&settings_scroll);
-
-    let settings_hint = gtk::Label::new(Some("A: Delete  •  B: Back"));
-    settings_hint.set_css_classes(&["control-hint"]);
-    settings_page.append(&settings_hint);
-
-    stack.add_named(&settings_page, Some(view_name(View::Settings)));
-
-    // ── Remaining pages: still placeholders (PLAN.md §5 roadmap phase 3+
-    // - per-instance management) ──
-    for view in [View::InstanceDetail] {
-        let placeholder = gtk::Label::new(Some(view_name(view)));
-        stack.add_named(&placeholder, Some(view_name(view)));
-    }
 
     window.set_child(Some(&stack));
 
     let state = Arc::new(Mutex::new(AppData {
         view: View::Login,
+        home_tab: HomeTab::Play,
+        dropdown: None,
         accounts: AccountStore::load(),
         instances: InstanceStore::load(),
         auth: auth::AuthState::Resolving,
         poll_cancel: None,
+        pending_delete: None,
+        notice_serial: 0,
         minecraft_running: false,
     }));
 
@@ -1379,15 +2137,36 @@ fn build_ui(app: &Application) {
         user_code_label,
         sign_in_btn: sign_in_btn.clone(),
         play_offline_btn: play_offline_btn.clone(),
-        home_status_label,
-        instance_list: instance_list.clone(),
-        add_instance_btn: add_instance_btn.clone(),
+        login_back_btn: login_back_btn.clone(),
+        top_bar,
+        account_btn: account_btn.clone(),
+        account_avatar,
+        account_name_label,
+        account_kind_label,
+        tab_play_btn: tab_play_btn.clone(),
+        tab_installs_btn: tab_installs_btn.clone(),
+        home_hint,
+        home_tabs,
+        new_install_btn: new_install_btn.clone(),
+        installs_list,
+        bottom_bar,
+        version_btn: version_btn.clone(),
+        version_title_label,
+        version_subtitle_label,
+        play_btn: play_btn.clone(),
+        play_label,
+        bottom_account_label,
+        notice,
+        notice_label,
         install_progress,
+        scrim: scrim.clone(),
+        accounts_panel,
+        accounts_items,
+        versions_panel,
+        versions_items,
         version_status_label,
         version_list,
-        accounts_list: accounts_list.clone(),
-        add_account_btn: add_account_btn.clone(),
-        settings_list,
+        grass_icon,
         sound: audio::Player::new(),
         haptics: None,
     };
@@ -1425,33 +2204,76 @@ fn build_ui(app: &Application) {
         }
     }
 
+    // ── Button wiring ──
+    // Every action is reachable by touch as well as by controller; the
+    // gamepad path below simply activates the focused button.
     {
-        let state = state.clone();
-        let widgets = widgets.clone();
+        let (state, widgets) = (state.clone(), widgets.clone());
         sign_in_btn.connect_clicked(move |_| start_sign_in(state.clone(), widgets.clone()));
     }
     {
-        let state = state.clone();
-        let widgets = widgets.clone();
+        let (state, widgets) = (state.clone(), widgets.clone());
         play_offline_btn.connect_clicked(move |_| start_play_offline(&state, &widgets));
     }
     {
-        let state = state.clone();
-        let widgets = widgets.clone();
-        add_instance_btn
-            .connect_clicked(move |_| open_version_picker(state.clone(), widgets.clone()));
+        let (state, widgets) = (state.clone(), widgets.clone());
+        login_back_btn.connect_clicked(move |_| return_home_from_login(&state, &widgets));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        account_btn
+            .connect_clicked(move |_| toggle_dropdown(&state, &widgets, Dropdown::Accounts));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        tab_play_btn.connect_clicked(move |_| set_home_tab(&state, &widgets, HomeTab::Play));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        tab_installs_btn
+            .connect_clicked(move |_| set_home_tab(&state, &widgets, HomeTab::Installations));
     }
     {
         let window = window.clone();
         quit_btn.connect_clicked(move |_| window.close());
     }
     {
-        let state = state.clone();
-        let widgets = widgets.clone();
+        let (state, widgets) = (state.clone(), widgets.clone());
+        version_btn
+            .connect_clicked(move |_| toggle_dropdown(&state, &widgets, Dropdown::Versions));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        play_btn.connect_clicked(move |_| play_selected(&state, &widgets));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        new_install_btn
+            .connect_clicked(move |_| open_version_picker(state.clone(), widgets.clone()));
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        new_install_item.connect_clicked(move |_| {
+            close_dropdown(&state, &widgets);
+            open_version_picker(state.clone(), widgets.clone());
+        });
+    }
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
         add_account_btn
             .connect_clicked(move |_| start_add_account(state.clone(), widgets.clone()));
     }
-    refresh_instance_grid(&state, &widgets);
+    {
+        let (state, widgets) = (state.clone(), widgets.clone());
+        version_back_btn.connect_clicked(move |_| handle_gp_back(&state, &widgets));
+    }
+    {
+        // Tapping outside an open dropdown closes it.
+        let (state, widgets) = (state.clone(), widgets.clone());
+        let tap = gtk::GestureClick::new();
+        tap.connect_released(move |_, _, _, _| close_dropdown(&state, &widgets));
+        scrim.add_controller(tap);
+    }
 
     // Shared with the keyboard handler below, so it can tell whether a
     // real gamepad is currently connected.
@@ -1459,12 +2281,13 @@ fn build_ui(app: &Application) {
         gilrs::Gilrs::new().ok().map(|g| Rc::new(RefCell::new(g)));
 
     // ── Keyboard fallback ──
-    // Arrow keys drive the same directional focus search as the D-Pad
-    // (GTK doesn't wire arrow keys to focus movement on its own, unlike
-    // Tab); Enter/Space already activate the focused widget via GTK's
-    // own default key handling, so only Escape needs an explicit hook.
+    // Arrow keys drive the same navigation as the D-Pad (GTK doesn't
+    // wire arrow keys to focus movement the way this UI needs);
+    // Enter/Space already activate the focused widget via GTK's own
+    // default key handling, so only Escape and the shortcuts need
+    // explicit hooks.
     //
-    // Up/Down are disabled outright whenever a real gamepad is
+    // Arrows are disabled outright whenever a real gamepad is
     // connected - not just debounced. On at least one real device
     // (Steam Input, per its hostname in that device's own AppArmor
     // logs) the same D-Pad press is *also* synthesized as a keyboard
@@ -1481,40 +2304,50 @@ fn build_ui(app: &Application) {
     let widgets_kb = widgets.clone();
     let gilrs_for_kb = gilrs_shared.clone();
     key_controller.connect_key_pressed(move |_, key, _, _| {
-        use gtk::gdk::Key;
+        use gdk::Key;
         let gamepad_connected = gilrs_for_kb
             .as_ref()
             .is_some_and(|g| g.borrow().gamepads().any(|(_, gp)| gp.is_connected()));
-        let handled = match key {
-            Key::Up if !gamepad_connected => step_focus(&widgets_kb.window, false),
-            Key::Down if !gamepad_connected => step_focus(&widgets_kb.window, true),
-            // Found via a real device trace: `Key(65364)` (GDK_KEY_Down)
-            // events keep arriving here even with a gamepad connected -
-            // Steam Input synthesizes a keyboard echo of the D-Pad
-            // press. Declining to act on it wasn't enough: returning
-            // Propagation::Proceed for it (as the catch-all arm below
-            // does) let GTK's *own* default arrow-key-to-focus
+        let dir = match key {
+            Key::Up => Some(Nav::Up),
+            Key::Down => Some(Nav::Down),
+            Key::Left => Some(Nav::Left),
+            Key::Right => Some(Nav::Right),
+            _ => None,
+        };
+        let handled = if let Some(dir) = dir {
+            // Found via a real device trace: arrow events keep arriving
+            // here even with a gamepad connected - Steam Input
+            // synthesizes a keyboard echo of the D-Pad press. Declining
+            // to act on it isn't enough: returning Propagation::Proceed
+            // would let GTK's *own* default arrow-key-to-focus
             // keybinding also process the same event afterward, moving
-            // focus a second time through a path neither `step_focus`
-            // nor anything else in this file ever sees or logs. These
-            // two keys must be swallowed outright whenever a gamepad
+            // focus a second time through a path nothing in this file
+            // ever sees. So they're swallowed outright while a gamepad
             // is connected, not just left unhandled.
-            Key::Up | Key::Down if gamepad_connected => true,
-            Key::Left => widgets_kb.window.child_focus(gtk::DirectionType::Left),
-            Key::Right => widgets_kb.window.child_focus(gtk::DirectionType::Right),
-            Key::Escape => {
-                handle_gp_back(&state_kb, &widgets_kb);
-                true
+            if !gamepad_connected {
+                navigate(&state_kb, &widgets_kb, dir);
             }
-            Key::x | Key::X if is_on_home(&state_kb) => {
-                open_accounts(&state_kb, &widgets_kb);
-                true
+            true
+        } else {
+            let action = match key {
+                Key::x | Key::X => Some(GamepadAction::OpenAccounts),
+                Key::y | Key::Y => Some(GamepadAction::OpenVersions),
+                Key::bracketleft => Some(GamepadAction::PrevTab),
+                Key::bracketright => Some(GamepadAction::NextTab),
+                _ => None,
+            };
+            match (key, action) {
+                (Key::Escape, _) => {
+                    handle_gp_back(&state_kb, &widgets_kb);
+                    true
+                }
+                (_, Some(action)) if is_on_home(&state_kb) => {
+                    handle_home_shortcut(&state_kb, &widgets_kb, action);
+                    true
+                }
+                _ => false,
             }
-            Key::y | Key::Y if is_on_home(&state_kb) => {
-                open_settings(&state_kb, &widgets_kb);
-                true
-            }
-            _ => false,
         };
         if handled {
             glib::Propagation::Stop
@@ -1527,9 +2360,10 @@ fn build_ui(app: &Application) {
     // ── Gamepad polling ──
     // One shared Gilrs instance, polled every 16ms via
     // glib::source::timeout_add_local, same cadence as gamepad-2048.
-    // Button identity for face buttons is resolved exclusively through
-    // input::classify_button (see input.rs for why); D-Pad directions
-    // are handled here directly, same split gamepad-2048 uses.
+    // Button identity for face/shoulder buttons is resolved exclusively
+    // through input::classify_button (see input.rs for why); D-Pad
+    // directions are handled here directly, same split gamepad-2048
+    // uses.
     if let Some(gilrs) = gilrs_shared {
         let state_for_gp = state.clone();
         let widgets_for_gp = widgets.clone();
@@ -1555,37 +2389,28 @@ fn build_ui(app: &Application) {
             }
             for gilrs::Event { event, .. } in events {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
-                    match button {
-                        gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
-                            nav_step_if_not_debounced(
-                                &dpad_nav_gate_gp,
-                                &widgets_for_gp.window,
-                                button == gilrs::Button::DPadDown,
-                            );
+                    let dir = match button {
+                        gilrs::Button::DPadUp => Some(Nav::Up),
+                        gilrs::Button::DPadDown => Some(Nav::Down),
+                        gilrs::Button::DPadLeft => Some(Nav::Left),
+                        gilrs::Button::DPadRight => Some(Nav::Right),
+                        _ => None,
+                    };
+                    if let Some(dir) = dir {
+                        nav_if_not_debounced(&dpad_nav_gate_gp, &state_for_gp, &widgets_for_gp, dir);
+                        continue;
+                    }
+                    match input::classify_button(button) {
+                        Some(GamepadAction::Confirm) => {
+                            handle_gp_confirm(&state_for_gp, &widgets_for_gp)
                         }
-                        gilrs::Button::DPadLeft => {
-                            widgets_for_gp.window.child_focus(gtk::DirectionType::Left);
+                        Some(GamepadAction::Back) => handle_gp_back(&state_for_gp, &widgets_for_gp),
+                        // TODO: SystemMenu (Start button power/system
+                        // overlay) once that screen exists.
+                        Some(GamepadAction::SystemMenu) | None => {}
+                        Some(action) => {
+                            handle_home_shortcut(&state_for_gp, &widgets_for_gp, action)
                         }
-                        gilrs::Button::DPadRight => {
-                            widgets_for_gp.window.child_focus(gtk::DirectionType::Right);
-                        }
-                        other => match input::classify_button(other) {
-                            Some(GamepadAction::Confirm) => {
-                                handle_gp_confirm(&state_for_gp, &widgets_for_gp)
-                            }
-                            Some(GamepadAction::Back) => {
-                                handle_gp_back(&state_for_gp, &widgets_for_gp)
-                            }
-                            Some(GamepadAction::OpenAccounts) if is_on_home(&state_for_gp) => {
-                                open_accounts(&state_for_gp, &widgets_for_gp)
-                            }
-                            Some(GamepadAction::RefreshOrSettings) if is_on_home(&state_for_gp) => {
-                                open_settings(&state_for_gp, &widgets_for_gp)
-                            }
-                            // TODO: SystemMenu (Start button power/system
-                            // overlay) once that screen exists.
-                            _ => {}
-                        },
                     }
                 }
             }

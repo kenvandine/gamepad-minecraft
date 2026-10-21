@@ -3,13 +3,13 @@
 A controller-first Minecraft Java Edition launcher, written in Rust and
 GTK4, for Ubuntu handheld gaming devices (Lenovo Legion Go S, MSI Claw).
 
-gamepad-minecraft borrows its colour palette and visual language from
-[gamepad-shell](https://github.com/kenvandine/gamepad-shell) (the Ubuntu
-"Resolute Raccoon" theme: aubergine backgrounds, orange accents), the
-same way its sibling [gamepad-2048](https://github.com/kenvandine/gamepad-2048)
-does. No keyboard or mouse is ever required: sign in with a Microsoft
-account via a QR-code device-code flow, then play fully offline afterward
-using a cached profile.
+Its look is modelled on the official Minecraft Launcher - a Play tab
+with big key art and a chunky green PLAY button, an Installations tab,
+and an account switcher - with original artwork drawn entirely in code
+(see [Artwork](#artwork)). No keyboard or mouse is ever required:
+everything works with a game controller or a touchscreen. Sign in with a
+Microsoft account via a QR-code device-code flow, then play fully offline
+afterward using a cached profile.
 
 Minecraft Java Edition itself is not distributed in this snap - the first
 launch requires network access to download it directly from Mojang, the
@@ -21,12 +21,17 @@ same as the official launcher.
   keyboard needed on the handheld itself
 - Play fully offline afterward using a cached profile - network is only
   required for the first sign-in and for downloading new content
-- Install and switch between multiple Minecraft versions side by side
+- Install and switch between multiple Minecraft versions side by side,
+  from the version dropdown next to PLAY or the Installations tab
+- Switch between several Microsoft (or offline) accounts from the
+  account dropdown in the top-left corner
 - New instances get Fabric Loader and the Controlify mod injected
   automatically, so Minecraft's own title screen is gamepad-navigable too
-- Full game-controller support throughout the launcher: D-pad/stick to
-  navigate, A to confirm, B to go back, X for accounts, Y for
-  refresh/settings
+- Full game-controller support throughout the launcher: D-pad to
+  navigate, A to confirm, B to go back, LB/RB to switch tabs, X for the
+  account switcher, Y for the version dropdown
+- Every control is also a large touch target, so a touchscreen alone is
+  enough
 
 ## Development setup (Ubuntu 26.04)
 
@@ -159,13 +164,32 @@ GAMEPAD_MINECRAFT_CLIENT_ID=<your-app-id> cargo run --example auth_cli
 
 | Path | Contents |
 | --- | --- |
-| `src/main.rs` | GTK4 UI and application wiring |
+| `src/main.rs`, `src/style.css` | GTK4 UI, application wiring and theme |
+| `src/pixelart.rs` | Blocky pixel font (PLAY button) and account avatars |
 | `src/auth.rs`, `src/account.rs` | Device-code sign-in chain and cached profile |
 | `src/instance.rs`, `src/fabric.rs`, `src/launch.rs` | Installing, patching (Fabric/Controlify) and launching Minecraft |
 | `src/input.rs`, `src/haptics.rs`, `src/audio.rs` | Gamepad input, rumble and sound |
-| `data/` | Desktop entry and icons |
+| `data/` | Desktop entry, icons, and the generated artwork in `data/art/` |
+| `examples/gen_art.rs` | Generator for the artwork in `data/art/` |
 | `snap/snapcraft.yaml` | Snap packaging |
 | `PLAN.md` | Architecture and design notes |
+
+### Artwork
+
+The Play tab's key art (an original Nether wastes scene), the
+"MINECRAFT / JAVA EDITION" wordmark and the grass-block icon are not
+Mojang assets: they're rendered by `examples/gen_art.rs`, a small voxel
+ray tracer with procedural block textures, and committed as PNGs under
+`data/art/` that the launcher embeds with `include_bytes!`. The player
+in the key art wears `data/art/hero-skin.png`, a standard 64x64 skin
+with slim arms; swap in another to change the character. To change
+them, edit the generator and re-run it:
+
+```sh
+cargo run --release --example gen_art            # writes data/art/*.png
+cargo run --release --example gen_art -- preview # quick low-res hero in target/
+cargo run --release --example gen_art -- closeup # close-up of the player in target/
+```
 
 ## Setting up Microsoft sign-in
 

@@ -78,6 +78,11 @@ pub struct InstanceMeta {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceStore {
     pub instances: Vec<InstanceMeta>,
+    /// The installation picked in the Play tab's version dropdown.
+    /// `#[serde(default)]` so stores written before this existed still
+    /// load.
+    #[serde(default)]
+    pub selected: Option<String>,
 }
 
 impl InstanceStore {
@@ -118,6 +123,32 @@ impl InstanceStore {
         let contents = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(Self::store_path(), contents).map_err(|e| e.to_string())
     }
+
+    /// The installation the Play button acts on: the player's last pick
+    /// if it still exists, otherwise the newest installed one, otherwise
+    /// whatever was added first (e.g. still downloading).
+    pub fn selected(&self) -> Option<&InstanceMeta> {
+        self.selected
+            .as_ref()
+            .and_then(|id| self.instances.iter().find(|i| &i.id == id))
+            .or_else(|| self.newest_installed())
+            .or_else(|| self.instances.first())
+    }
+
+    /// The highest-versioned fully installed instance.
+    pub fn newest_installed(&self) -> Option<&InstanceMeta> {
+        self.instances
+            .iter()
+            .filter(|i| i.state == InstallState::Installed)
+            .max_by(|a, b| compare_versions(&a.mc_version, &b.mc_version))
+    }
+}
+
+/// Orders release ids numerically ("1.21.10" > "1.21.9", "26.3" >
+/// "1.21.10"), which plain string comparison gets wrong.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    parts(a).cmp(&parts(b))
 }
 
 /// Fetches Mojang's version manifest. Requires network; there is no
@@ -473,6 +504,46 @@ mod tests {
     #[test]
     fn new_store_is_empty() {
         assert!(InstanceStore::default().instances.is_empty());
+    }
+
+    fn meta(version: &str, state: InstallState) -> InstanceMeta {
+        InstanceMeta {
+            id: version.into(),
+            mc_version: version.into(),
+            loader: Loader::Fabric,
+            state,
+        }
+    }
+
+    #[test]
+    fn versions_compare_numerically() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.21.10", "1.21.9"), Ordering::Greater);
+        assert_eq!(compare_versions("26.3", "1.21.10"), Ordering::Greater);
+        assert_eq!(compare_versions("1.21", "1.21.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn selection_falls_back_to_newest_installed() {
+        let mut store = InstanceStore {
+            instances: vec![
+                meta("1.20.1", InstallState::Installed),
+                meta("1.21.4", InstallState::Installed),
+                meta("1.21.5", InstallState::Failed),
+            ],
+            selected: None,
+        };
+        assert_eq!(store.selected().unwrap().id, "1.21.4");
+        store.selected = Some("1.20.1".into());
+        assert_eq!(store.selected().unwrap().id, "1.20.1");
+        store.selected = Some("deleted".into());
+        assert_eq!(store.selected().unwrap().id, "1.21.4");
+    }
+
+    #[test]
+    fn store_without_selection_field_still_loads() {
+        let store: InstanceStore = serde_json::from_str(r#"{"instances": []}"#).unwrap();
+        assert!(store.selected.is_none());
     }
 
     // sha1_hex/file_matches/download_and_verify moved to net.rs (shared
