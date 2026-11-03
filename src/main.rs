@@ -2387,7 +2387,7 @@ fn build_ui(app: &Application) {
             if state_for_gp.lock().unwrap().minecraft_running {
                 return glib::ControlFlow::Continue;
             }
-            for gilrs::Event { event, .. } in events {
+            for gilrs::Event { id, event, .. } in events {
                 if let gilrs::EventType::ButtonPressed(button, _) = event {
                     let dir = match button {
                         gilrs::Button::DPadUp => Some(Nav::Up),
@@ -2400,7 +2400,12 @@ fn build_ui(app: &Application) {
                         nav_if_not_debounced(&dpad_nav_gate_gp, &state_for_gp, &widgets_for_gp, dir);
                         continue;
                     }
-                    match input::classify_button(button) {
+                    let swap_xy = {
+                        let gp = gilrs.borrow();
+                        let pad = gp.gamepad(id);
+                        input::swaps_x_and_y(pad.vendor_id(), pad.product_id())
+                    };
+                    match input::classify_button(button, swap_xy) {
                         Some(GamepadAction::Confirm) => {
                             handle_gp_confirm(&state_for_gp, &widgets_for_gp)
                         }
